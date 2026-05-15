@@ -263,6 +263,513 @@ def _detect_spelling_traps(text: str):
     return present
 
 
+# ======================================================================
+# Bulletproof Italian verb-to-subject agreement verifier.
+#
+# Used as a post-generation safety net to catch the LLM's most common
+# mistake: emitting an Italian sentence whose verb conjugation doesn't
+# match the English translation's subject pronoun.
+#
+# Example bug we want to catch:
+#     Italian:  "Sono a casa."        (verb 'sono' = 1sg OR 3pl)
+#     English:  "He/She is at home."  (subject 'He/She' = 3sg)  ← WRONG
+#
+# Approach: find the main finite verb in the Italian sentence, look up
+# what subject(s) it allows, then check the English starts with one of
+# those subjects. We bail out (return "consistent") on anything
+# ambiguous — better to let a questionable sentence through than to
+# wrongly reject a correct one.
+# ======================================================================
+
+# Italian words that can precede the main verb and should be skipped.
+# Adverbs, conjunctions, negation, proclitic pronouns, common adverbials.
+_PRE_VERB_SKIP = {
+    # negation & emphasis
+    "non", "mai", "mica", "nemmeno", "neanche", "neppure",
+    # adverbs of time/frequency/manner
+    "anche", "ancora", "appena", "comunque", "domani", "ieri", "oggi",
+    "forse", "magari", "sempre", "spesso", "qui", "qua", "lì", "là",
+    "presto", "tardi", "subito", "adesso", "ora", "prima", "dopo",
+    "molto", "poco", "tanto", "troppo", "abbastanza", "raramente",
+    "talvolta", "improvvisamente", "purtroppo", "fortunatamente",
+    "veramente", "davvero", "proprio", "solo", "soltanto", "quasi",
+    # conjunctions
+    "e", "ma", "però", "quindi", "allora", "perciò", "infatti",
+    "perché", "dunque", "cioè", "anzi", "tuttavia",
+    # proclitic pronouns (don't change verb person)
+    "mi", "ti", "ci", "vi", "si", "lo", "la", "li", "le", "gli", "ne",
+    "me", "te", "se", "ce", "ve",
+    "glielo", "gliela", "glieli", "gliele", "gliene",
+    "melo", "mela", "meli", "mele", "mene",
+    "telo", "tela", "teli", "tele", "tene",
+    "celo", "cela", "celi", "cele", "cene",
+    "velo", "vela", "veli", "vele", "vene",
+    # explicit subject pronouns — they DO indicate person, but the verb
+    # right after will also match, so skipping them is safe.
+    "io", "tu", "lui", "lei", "egli", "ella", "esso", "essa",
+    "noi", "voi", "loro", "essi", "esse",
+    # common articles/prepositions/quantifiers that could start a sentence
+    # but aren't verbs ("Il bambino mangia", "Tutti dormono")
+    "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "un'", "l'",
+    "del", "dello", "della", "dei", "degli", "delle", "dell'",
+    "al", "allo", "alla", "ai", "agli", "alle", "all'",
+    "dal", "dallo", "dalla", "dai", "dagli", "dalle", "dall'",
+    "nel", "nello", "nella", "nei", "negli", "nelle", "nell'",
+    "sul", "sullo", "sulla", "sui", "sugli", "sulle", "sull'",
+    "di", "a", "da", "in", "con", "su", "per", "tra", "fra",
+    "tutto", "tutti", "tutta", "tutte", "qualche", "alcuni", "alcune",
+    "ogni", "molto", "molti", "molta", "molte",
+    # interjections
+    "ah", "oh", "ehi", "ehilà", "boh", "beh", "mah", "dai",
+}
+
+# Hard-coded high-frequency irregular forms (essere, avere, andare, fare,
+# dire, dare, stare, sapere, volere, potere, dovere, venire, etc.).
+# Maps Italian form → allowed English subjects.
+_IRREGULAR_VERBS = {
+    # essere (to be)
+    "sono":    ("I", "They"),
+    "sei":     ("You",),
+    "è":       ("He", "She", "It", "He/She"),
+    "siamo":   ("We",),
+    "siete":   ("You",),
+    # 'sono' is 3pl too — already covered above
+    "ero":     ("I",),
+    "eri":     ("You",),
+    "era":     ("He", "She", "It", "He/She"),
+    "eravamo": ("We",),
+    "eravate": ("You",),
+    "erano":   ("They",),
+    "sarò":    ("I",),
+    "sarai":   ("You",),
+    "sarà":    ("He", "She", "It", "He/She"),
+    "saremo":  ("We",),
+    "sarete":  ("You",),
+    "saranno": ("They",),
+    "sia":     ("I", "He", "She", "It", "He/She"),  # 1sg, 2sg, 3sg congiuntivo
+    "siano":   ("They",),
+    "fossi":   ("I", "You"),  # 1sg or 2sg congiuntivo imperfetto
+    "fosse":   ("He", "She", "It", "He/She"),
+    "fossero": ("They",),
+    "sarei":   ("I",),
+    "saresti": ("You",),
+    "sarebbe": ("He", "She", "It", "He/She"),
+    "saremmo": ("We",),
+    "sareste": ("You",),
+    "sarebbero": ("They",),
+
+    # avere (to have)
+    "ho":      ("I",),
+    "hai":     ("You",),
+    "ha":      ("He", "She", "It", "He/She"),
+    "abbiamo": ("We",),
+    "avete":   ("You",),
+    "hanno":   ("They",),
+    "avevo":   ("I",),
+    "avevi":   ("You",),
+    "aveva":   ("He", "She", "It", "He/She"),
+    "avevamo": ("We",),
+    "avevate": ("You",),
+    "avevano": ("They",),
+    "avrò":    ("I",),
+    "avrai":   ("You",),
+    "avrà":    ("He", "She", "It", "He/She"),
+    "avremo":  ("We",),
+    "avrete":  ("You",),
+    "avranno": ("They",),
+    "abbia":   ("I", "He", "She", "It", "He/She"),
+    "abbiano": ("They",),
+    "avessi":  ("I", "You"),
+    "avesse":  ("He", "She", "It", "He/She"),
+    "avessero": ("They",),
+    "avrei":   ("I",),
+    "avresti": ("You",),
+    "avrebbe": ("He", "She", "It", "He/She"),
+    "avremmo": ("We",),
+    "avreste": ("You",),
+    "avrebbero": ("They",),
+
+    # andare (to go) — irregular present
+    "vado":    ("I",),
+    "vai":     ("You",),
+    "va":      ("He", "She", "It", "He/She"),
+    "andiamo": ("We",),
+    "andate":  ("You",),
+    "vanno":   ("They",),
+
+    # fare (to do/make) — irregular present
+    "faccio":  ("I",),
+    "fai":     ("You",),
+    "fa":      ("He", "She", "It", "He/She"),
+    "facciamo": ("We",),
+    "fate":    ("You",),
+    "fanno":   ("They",),
+
+    # dire (to say)
+    "dico":    ("I",),
+    "dici":    ("You",),
+    "dice":    ("He", "She", "It", "He/She"),
+    "diciamo": ("We",),
+    "dite":    ("You",),
+    "dicono":  ("They",),
+
+    # dare (to give)
+    "do":      ("I",),
+    "dai":     ("You",),  # NOTE: also "dai" = "come on!" or "from the"
+    "dà":      ("He", "She", "It", "He/She"),
+    "diamo":   ("We",),
+    "date":    ("You",),
+    "danno":   ("They",),
+
+    # stare (to be/stay)
+    "sto":     ("I",),
+    "stai":    ("You",),
+    "sta":     ("He", "She", "It", "He/She"),
+    "stiamo":  ("We",),
+    "state":   ("You",),
+    "stanno":  ("They",),
+
+    # sapere (to know)
+    "so":      ("I",),
+    "sai":     ("You",),
+    "sa":      ("He", "She", "It", "He/She"),
+    "sappiamo": ("We",),
+    "sapete":  ("You",),
+    "sanno":   ("They",),
+
+    # volere (to want)
+    "voglio":  ("I",),
+    "vuoi":    ("You",),
+    "vuole":   ("He", "She", "It", "He/She"),
+    "vogliamo": ("We",),
+    "volete":  ("You",),
+    "vogliono": ("They",),
+
+    # potere (can/be able)
+    "posso":   ("I",),
+    "puoi":    ("You",),
+    "può":     ("He", "She", "It", "He/She"),
+    "possiamo": ("We",),
+    "potete":  ("You",),
+    "possono": ("They",),
+
+    # dovere (must/have to)
+    "devo":    ("I",),
+    "devi":    ("You",),
+    "deve":    ("He", "She", "It", "He/She"),
+    "dobbiamo": ("We",),
+    "dovete":  ("You",),
+    "devono":  ("They",),
+
+    # venire (to come)
+    "vengo":   ("I",),
+    "vieni":   ("You",),
+    "viene":   ("He", "She", "It", "He/She"),
+    "veniamo": ("We",),
+    "venite":  ("You",),
+    "vengono": ("They",),
+
+    # uscire (to go out)
+    "esco":    ("I",),
+    "esci":    ("You",),
+    "esce":    ("He", "She", "It", "He/She"),
+    "usciamo": ("We",),
+    "uscite":  ("You",),
+    "escono":  ("They",),
+
+    # tenere (to hold/keep)
+    "tengo":   ("I",),
+    "tieni":   ("You",),
+    "tiene":   ("He", "She", "It", "He/She"),
+    "teniamo": ("We",),
+    "tenete":  ("You",),
+    "tengono": ("They",),
+
+    # piacere (to like — usually 3sg/3pl)
+    "piace":   ("He", "She", "It", "He/She"),
+    "piacciono": ("They",),
+}
+
+
+def _looks_like_finite_verb(token: str):
+    """
+    Detect whether a token looks like a finite (conjugated) Italian verb
+    based on its ending. Returns the allowed English subjects tuple,
+    or None if the token isn't unambiguously a verb form.
+
+    Designed to be CONSERVATIVE: returns None on anything ambiguous
+    rather than risk a false positive. The LLM's prompt does the
+    heavy lifting; this is the safety net for unambiguous cases.
+    """
+    if not token:
+        return None
+    tok = token.lower()
+
+    # 1. Check the irregular-form lookup first — this catches short forms
+    #    like 'è', 'ha', 'ho' that wouldn't pass length heuristics below.
+    if tok in _IRREGULAR_VERBS:
+        return _IRREGULAR_VERBS[tok]
+
+    # Past this point we need length >= 3 to apply ending heuristics safely.
+    if len(tok) < 3:
+        return None
+
+    # 2. Generic verb-ending heuristics for regular conjugations.
+    #    We're looking for endings that ONLY appear on verbs (not nouns
+    #    or adjectives) and that unambiguously mark person.
+    #
+    #    The tricky thing: -o, -a, -i, -e are also noun/adjective endings,
+    #    so we can't trust them alone. -iamo, -ate/-ete/-ite, -ano/-ono
+    #    are nearly verb-exclusive and safe to use.
+
+    # 1pl -iamo (parliamo, mangiamo, dormiamo, capiamo)
+    if tok.endswith("iamo") and len(tok) >= 5:
+        return ("We",)
+
+    # 2pl -ate / -ete / -ite (verb 2pl present indicative)
+    # NB: this also matches the past participle 'state', but 'state' is
+    # in _IRREGULAR_VERBS so it's caught first.
+    # Avoid matching obvious nouns/adjectives like 'estate' (summer) —
+    # but those usually wouldn't start a clause as a verb anyway.
+    if (tok.endswith(("ate", "ete", "ite"))
+            and len(tok) >= 4
+            and tok not in {"estate", "etichette", "polite", "elite", "limite"}):
+        return ("You",)
+
+    # 3pl -ano / -ono (parlano, mangiano, dormono, capiscono)
+    if tok.endswith(("ano", "ono")) and len(tok) >= 4:
+        # Exclude common non-verb words ending in -ano/-ono
+        if tok not in {"piano", "umano", "lontano", "ano", "mano", "anno",
+                       "soprano", "italiano", "americano", "africano",
+                       "siciliano", "tono", "sono", "buono", "uomo"}:
+            return ("They",)
+
+    # 1sg congiuntivo / imperfetto endings -assi/-essi/-issi (be conservative)
+    # Skip — too risky given short words.
+
+    # 2sg imperfetto -avi/-evi/-ivi
+    if tok.endswith(("avi", "evi", "ivi")) and len(tok) >= 4:
+        return ("You",)
+
+    # 1sg imperfetto -avo/-evo/-ivo (parlavo, leggevo, dormivo)
+    if tok.endswith(("avo", "evo", "ivo")) and len(tok) >= 4:
+        # Skip ambiguous cases — 'nuovo' (new) ends in -ovo but is adj
+        if tok not in {"nuovo", "uovo", "ovvio"}:
+            return ("I",)
+
+    # 3sg imperfetto -ava/-eva/-iva (parlava, leggeva, dormiva)
+    if tok.endswith(("ava", "eva", "iva")) and len(tok) >= 4:
+        if tok not in {"nuova", "uova", "ovvia"}:
+            return ("He", "She", "It", "He/She")
+
+    # 1pl imperfetto -avamo/-evamo/-ivamo
+    if tok.endswith(("avamo", "evamo", "ivamo")) and len(tok) >= 6:
+        return ("We",)
+
+    # 2pl imperfetto -avate/-evate/-ivate
+    if tok.endswith(("avate", "evate", "ivate")) and len(tok) >= 6:
+        return ("You",)
+
+    # 3pl imperfetto -avano/-evano/-ivano
+    if tok.endswith(("avano", "evano", "ivano")) and len(tok) >= 6:
+        return ("They",)
+
+    # Future tense -ò (1sg), -ai (2sg, but ambiguous with hai/dai), -à (3sg)
+    # 1sg future: -erò/-irò (parlerò, dormirò)
+    if tok.endswith(("erò", "irò", "arò")) and len(tok) >= 4:
+        return ("I",)
+    # 3sg future: -erà/-irà/-arà
+    if tok.endswith(("erà", "irà", "arà")) and len(tok) >= 4:
+        return ("He", "She", "It", "He/She")
+    # 1pl future: -emo/-imo (parleremo, dormiremo)
+    if tok.endswith(("eremo", "iremo", "aremo")) and len(tok) >= 5:
+        return ("We",)
+    # 3pl future: -anno (parleranno, dormiranno) — careful, 'anno' (year)
+    # is a noun. Require length >= 7 to exclude 'anno'.
+    if tok.endswith(("eranno", "iranno", "aranno")) and len(tok) >= 7:
+        return ("They",)
+
+    # Condizionale 1sg: -ei (parlerei, dormirei) — too short and ambiguous, skip
+    # Condizionale 3sg: -ebbe — distinctive
+    if tok.endswith("ebbe") and len(tok) >= 6:
+        return ("He", "She", "It", "He/She")
+    # Condizionale 3pl: -ebbero
+    if tok.endswith("ebbero") and len(tok) >= 7:
+        return ("They",)
+    # Condizionale 1pl: -emmo
+    if tok.endswith("emmo") and len(tok) >= 6:
+        return ("We",)
+
+    # Passato remoto 3sg -ò (parlò, dormì) — single-char ending, too risky to detect alone
+
+    return None
+
+
+def _find_main_verb_and_subjects(italian_text: str):
+    """
+    Scan the Italian sentence for the first finite verb that gives us
+    unambiguous subject info. Skips negation, adverbs, conjunctions, and
+    proclitic pronouns. Returns (verb_token, allowed_subjects) or
+    (None, None) if no detectable finite verb is found in the first
+    several tokens.
+    """
+    if not italian_text:
+        return (None, None)
+    import re as _re
+    tokens_raw = _re.split(r"\s+", italian_text.strip())
+    tokens = [t.lower().strip(".,;:!?\"'’()[]") for t in tokens_raw if t.strip()]
+
+    # Look at the first 6 tokens — beyond that, the sentence is likely
+    # complex enough that our heuristics aren't trustworthy.
+    for tok in tokens[:6]:
+        if not tok or tok in _PRE_VERB_SKIP:
+            continue
+        subjects = _looks_like_finite_verb(tok)
+        if subjects is not None:
+            return (tok, subjects)
+        # If we hit a non-skip non-verb word, the sentence structure is
+        # something like "Il bambino mangia" — already covered because
+        # "il" is in _PRE_VERB_SKIP but "bambino" isn't a verb. We
+        # continue scanning a couple more tokens to handle this.
+
+    return (None, None)
+
+
+def _english_starts_with_subject(english_text: str, allowed_subjects):
+    """
+    Check if the English string starts (after optional leading adverbs)
+    with one of the allowed subject pronouns.
+
+    Handles:
+      - Contractions: "I'm", "You're", "He's", "They've"
+      - Leading adverbs: "Tomorrow I will...", "Yesterday he ate..."
+      - Capital and lowercase variants
+      - Explicit noun subjects when the verb is 3rd person ("The dog
+        barks", "My friend speaks", "Maria sings") — these are accepted
+        for 3sg/3pl verbs because pronoun-replacement isn't required.
+    """
+    if not english_text:
+        return False
+    import re as _re
+    eng = english_text.strip()
+
+    # Strip leading adverbial phrases like "Tomorrow,", "Yesterday,",
+    # "Now", "Often", "Sometimes", "Today" etc. These can prefix the
+    # English without affecting subject agreement.
+    leading_skip = (
+        "tomorrow", "yesterday", "today", "now", "often", "sometimes",
+        "always", "never", "soon", "later", "early", "perhaps", "maybe",
+        "actually", "really", "quickly", "slowly", "here", "there",
+        "in fact", "of course", "at home", "at school", "at work",
+    )
+    eng_lower = eng.lower()
+    for prefix in leading_skip:
+        if eng_lower.startswith(prefix + " ") or eng_lower.startswith(prefix + ","):
+            eng = eng[len(prefix):].lstrip(" ,")
+            break
+
+    # Direct pronoun match
+    for subj in allowed_subjects:
+        # Match "I ", "I'm", "I've", "You're", "He's", "They've",
+        # including straight and curly apostrophes.
+        pattern = rf"^{_re.escape(subj)}\b['’]?\w*"
+        if _re.match(pattern, eng, _re.IGNORECASE):
+            return True
+
+    # Fallback: if the allowed subjects are 3rd-person (He/She/It/They),
+    # also accept any noun-phrase subject ("The dog barks", "My friend
+    # speaks", "Maria sings"). We do this by checking that the first
+    # token is NOT any English personal pronoun — if it's a real noun,
+    # determiner, or proper name, pronoun-replacement isn't required.
+    if any(s in ("He", "She", "It", "He/She", "They") for s in allowed_subjects):
+        first_token = _re.split(r"\W+", eng, maxsplit=1)[0].lower()
+        ALL_ENGLISH_PRONOUNS = {
+            "i", "we", "you", "he", "she", "it", "they",
+            "me", "us", "him", "her", "them",
+            "my", "our", "your", "his", "their",  # possessive determiners — these DO precede nouns
+        }
+        # If the first token is a pronoun, the direct match above would
+        # have caught it if it were valid. Anything else (noun, proper
+        # name, "The", "A", "Maria", etc.) is treated as a valid 3rd-
+        # person noun subject.
+        # NOTE: possessive determiners like "My friend" CAN validly
+        # introduce a 3rd-person subject. So we accept them too.
+        POSSESSIVE_DETS = {"my", "our", "your", "his", "her", "their", "its"}
+        if first_token in POSSESSIVE_DETS:
+            return True
+        if first_token and first_token not in ALL_ENGLISH_PRONOUNS:
+            return True
+
+    return False
+
+
+def _verify_subject_agreement(italian_text: str, english_text: str):
+    """
+    Verify that the English translation's subject pronoun is consistent
+    with the conjugation of the main Italian verb.
+
+    Returns:
+        (is_consistent, allowed_subjects_or_None, detected_verb_or_None)
+
+    is_consistent is True iff:
+      - We detected a clear finite verb in the Italian AND the English's
+        leading subject matches what that verb allows, OR
+      - We could NOT detect a finite verb (bail out — don't flag), OR
+      - The sentence uses a piacere-family verb (inverted IT↔EN subject,
+        so the check doesn't apply).
+    """
+    # Skip verification entirely for piacere-family verbs. These flip the
+    # subject between Italian and English: 'Mi piace X' = 'I like X', where
+    # X is the Italian subject but the English object. Our normal check
+    # would wrongly flag "I like coffee" against piace (3sg).
+    if _has_piacere_family_verb(italian_text):
+        return (True, None, None)
+
+    verb, allowed = _find_main_verb_and_subjects(italian_text)
+    if not verb or not allowed:
+        # No detectable verb — don't flag. The LLM might be right or
+        # wrong; we just can't tell, so we let it through.
+        return (True, None, None)
+    if _english_starts_with_subject(english_text, allowed):
+        return (True, allowed, verb)
+    return (False, allowed, verb)
+
+
+# Piacere-family verbs invert subject/object between Italian and English.
+# When any of these forms appear, our normal subject-agreement check
+# doesn't apply because the Italian subject becomes the English object.
+_PIACERE_FAMILY = {
+    # piacere
+    "piace", "piacciono", "piaceva", "piacevano", "piacerà", "piaceranno",
+    "piacque", "piacquero", "piaciuto", "piaciuta", "piaciuti", "piaciute",
+    # mancare ("to be missing/lacking" — "mi manca casa" = "I miss home")
+    "manca", "mancano", "mancava", "mancavano", "mancherà", "mancheranno",
+    # servire ("to be needed" — "mi serve un libro" = "I need a book")
+    "serve", "servono", "serviva", "servivano", "servirà", "serviranno",
+    # bastare ("to be enough" — "mi basta così" = "that's enough for me")
+    "basta", "bastano", "bastava", "bastavano", "basterà", "basteranno",
+    # restare/rimanere ("to remain/be left" — used like piacere sometimes)
+    # importare ("to matter" — "non mi importa" = "I don't care")
+    "importa", "importano", "importava", "importeranno",
+    # interessare ("to interest" — "mi interessa" = "I'm interested")
+    "interessa", "interessano", "interessava", "interessavano",
+    # dispiacere ("to be sorry" — "mi dispiace" = "I'm sorry")
+    "dispiace", "dispiacciono", "dispiaceva",
+    # occorrere ("to be needed")
+    "occorre", "occorrono",
+}
+
+
+def _has_piacere_family_verb(italian_text: str):
+    """True if the sentence contains a piacere-family verb form."""
+    if not italian_text:
+        return False
+    import re as _re
+    tokens = [t.lower().strip(".,;:!?\"'’()[]")
+              for t in _re.split(r"\s+", italian_text.strip()) if t.strip()]
+    return any(tok in _PIACERE_FAMILY for tok in tokens)
+
+
 # ----------------------------------------------------------------------
 # Per-category distractor playbooks — INJECTED into the prompt based on
 # what kind of target word is being tested.
@@ -693,64 +1200,25 @@ def generate_dictation_exercise(target_word_dict):
                 wb_entry["stress"] = item["stress"]
             word_breakdown.append(wb_entry)
 
-        # --- Verb/pronoun agreement safety net ---
-        # Catches the common LLM mistake of labelling "Sono a casa" as
-        # "He/She is at home" or similar. We look for unambiguous verb
-        # forms at the start of the sentence and verify the English subject
-        # matches.
-        import re as _re_agree
-        first_word = (final_italian or "").strip().split()
-        first_word = first_word[0].lower().strip(".,;:!?\"'’") if first_word else ""
-
-        # Map of unambiguous Italian verbs → allowed English subject prefixes
-        # Forms that allow multiple persons (e.g. 'sono' = io or loro) accept either.
-        VERB_TO_ENGLISH_SUBJECT = {
-            # essere
-            "sono":  ("I", "They"),               # 1sg or 3pl
-            "sei":   ("You",),                    # 2sg
-            "è":     ("He", "She", "It", "He/She"),
-            "siamo": ("We",),
-            "siete": ("You",),                    # 2pl (you all)
-            # avere
-            "ho":    ("I",),
-            "hai":   ("You",),
-            "ha":    ("He", "She", "It", "He/She"),
-            "abbiamo": ("We",),
-            "avete": ("You",),
-            "hanno": ("They",),
-        }
-
-        def _english_starts_with_subject(eng: str, allowed_subjects: tuple) -> bool:
-            """Check if the English string starts with one of the allowed subjects."""
-            eng_stripped = eng.strip()
-            for subj in allowed_subjects:
-                # Match "I ", "I'm", "I've", "They ", "They're", "He ", "He's", etc.
-                if _re_agree.match(rf"^{_re_agree.escape(subj)}\b['’]?\w*", eng_stripped, _re_agree.IGNORECASE):
-                    return True
-            return False
-
-        if first_word in VERB_TO_ENGLISH_SUBJECT:
-            allowed = VERB_TO_ENGLISH_SUBJECT[first_word]
-            if not _english_starts_with_subject(english_correct, allowed):
-                logging.warning(
-                    f"Verb/subject mismatch: Italian starts with '{first_word}' "
-                    f"(requires {allowed}), but English was: '{english_correct}'. "
-                    f"Filtering out distractors with same mismatch."
-                )
-                # Filter distractors that also start with a disallowed subject.
-                # We don't try to rewrite the English ourselves — we let the
-                # caller regenerate. Mark the exercise as suspect.
-                english_distractors = [
-                    d for d in english_distractors
-                    if _english_starts_with_subject(d, allowed)
-                ]
-                # If after filtering we still have a correct + 3 distractors,
-                # the AI just got the correct answer wrong. The safest thing
-                # is to keep one of the (now correctly-prefixed) distractors
-                # as the correct answer if it makes sense, but we can't know
-                # which one. Instead: log loudly and trust the user to flag
-                # the card. We do still return the data so the UI doesn't
-                # crash.
+        # --- Verb/pronoun agreement safety net (bulletproof verifier) ---
+        # Verifies that the English translation's subject pronoun matches the
+        # person of the main Italian verb. Catches the LLM's most common
+        # generation bug: e.g. labelling "Sono a casa" as "He/She is at home".
+        agreement_ok, allowed_subjects, detected_verb = _verify_subject_agreement(
+            final_italian, english_correct
+        )
+        if not agreement_ok and allowed_subjects:
+            logging.warning(
+                f"Verb/subject mismatch detected: Italian verb '{detected_verb}' "
+                f"requires English subject in {allowed_subjects}, but got: "
+                f"'{english_correct}'."
+            )
+            # Filter distractors with the same mismatch so we don't show
+            # multiple wrong-person options.
+            english_distractors = [
+                d for d in english_distractors
+                if _english_starts_with_subject(d, allowed_subjects)
+            ]
         # --- Spelling-trap post-processing safety net ---
         present_traps = _detect_spelling_traps(final_italian)
         english_correct = raw_data.get("english_correct", final_english)
