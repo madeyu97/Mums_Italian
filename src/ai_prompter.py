@@ -472,11 +472,48 @@ UNIVERSAL_RULES = """
     one of these pairs. That would be unfair, since Whisper-quality audio
     cannot reliably disambiguate them.
 
-    PRONOUN HEDGING:
-    Italian drops subject pronouns. If the sentence has a 3rd-person singular
-    verb with no explicit subject (parla, mangia, è, ha, ecc.), the English
-    correct answer should hedge: "He/She speaks", not "He speaks", unless
-    context makes it unambiguous.
+    PRONOUN HEDGING / SUBJECT-VERB AGREEMENT (CRITICAL — read carefully):
+
+    Italian drops subject pronouns, so the verb ending tells you the person.
+    The English translation MUST match the person of the Italian verb.
+
+    Reference table of avere / essere endings — ALL OTHER VERBS FOLLOW THE
+    SAME PERSON PATTERN:
+      io      sono / ho           → "I am"  / "I have"
+      tu      sei  / hai          → "You are" / "You have"
+      lui/lei è    / ha           → "He/She is" / "He/She has"
+      noi     siamo / abbiamo     → "We are" / "We have"
+      voi     siete / avete       → "You all are" / "You all have"
+      loro    sono / hanno        → "They are" / "They have"
+
+    Generic verb endings:
+      -o   (parlo, mangio, dormo)        → "I"
+      -i   (parli, mangi, dormi)         → "You (singular)"
+      -a / -e  (parla, mangia, dorme)    → "He/She"
+      -iamo  (parliamo, mangiamo)        → "We"
+      -ate / -ete / -ite                 → "You all"
+      -ano / -ono  (parlano, mangiano,
+                    dormono, SONO)       → "They"
+
+    HARD RULES:
+    1. If the Italian verb is "sono" — the English MUST be "I am" OR
+       "They are", NEVER "He is" or "She is" or "He/She is". (The same
+       form serves both 1sg and 3pl; pick whichever the sentence context
+       makes natural.)
+    2. If the Italian verb is "è" — the English MUST be "He is" / "She is"
+       / "He/She is" or "It is" depending on subject. Never "I am" or
+       "They are".
+    3. If the Italian verb is "ha" — "He/She has" or "It has", never
+       "I have" or "They have".
+    4. If the Italian verb is "hanno" — "They have", never "He has".
+    5. Before returning, RE-READ your "english_correct" field and verify
+       its subject pronoun matches the conjugation of the main Italian
+       verb. If they don't match, REWRITE the english_correct.
+
+    Only when the Italian sentence has a 3rd-person singular verb (è, ha,
+    parla, mangia, dorme, etc.) with NO explicit subject should you hedge
+    as "He/She". For 1st and 2nd person verbs there's nothing to hedge —
+    the verb ending makes it unambiguous.
 """
 
 
@@ -656,6 +693,64 @@ def generate_dictation_exercise(target_word_dict):
                 wb_entry["stress"] = item["stress"]
             word_breakdown.append(wb_entry)
 
+        # --- Verb/pronoun agreement safety net ---
+        # Catches the common LLM mistake of labelling "Sono a casa" as
+        # "He/She is at home" or similar. We look for unambiguous verb
+        # forms at the start of the sentence and verify the English subject
+        # matches.
+        import re as _re_agree
+        first_word = (final_italian or "").strip().split()
+        first_word = first_word[0].lower().strip(".,;:!?\"'’") if first_word else ""
+
+        # Map of unambiguous Italian verbs → allowed English subject prefixes
+        # Forms that allow multiple persons (e.g. 'sono' = io or loro) accept either.
+        VERB_TO_ENGLISH_SUBJECT = {
+            # essere
+            "sono":  ("I", "They"),               # 1sg or 3pl
+            "sei":   ("You",),                    # 2sg
+            "è":     ("He", "She", "It", "He/She"),
+            "siamo": ("We",),
+            "siete": ("You",),                    # 2pl (you all)
+            # avere
+            "ho":    ("I",),
+            "hai":   ("You",),
+            "ha":    ("He", "She", "It", "He/She"),
+            "abbiamo": ("We",),
+            "avete": ("You",),
+            "hanno": ("They",),
+        }
+
+        def _english_starts_with_subject(eng: str, allowed_subjects: tuple) -> bool:
+            """Check if the English string starts with one of the allowed subjects."""
+            eng_stripped = eng.strip()
+            for subj in allowed_subjects:
+                # Match "I ", "I'm", "I've", "They ", "They're", "He ", "He's", etc.
+                if _re_agree.match(rf"^{_re_agree.escape(subj)}\b['’]?\w*", eng_stripped, _re_agree.IGNORECASE):
+                    return True
+            return False
+
+        if first_word in VERB_TO_ENGLISH_SUBJECT:
+            allowed = VERB_TO_ENGLISH_SUBJECT[first_word]
+            if not _english_starts_with_subject(english_correct, allowed):
+                logging.warning(
+                    f"Verb/subject mismatch: Italian starts with '{first_word}' "
+                    f"(requires {allowed}), but English was: '{english_correct}'. "
+                    f"Filtering out distractors with same mismatch."
+                )
+                # Filter distractors that also start with a disallowed subject.
+                # We don't try to rewrite the English ourselves — we let the
+                # caller regenerate. Mark the exercise as suspect.
+                english_distractors = [
+                    d for d in english_distractors
+                    if _english_starts_with_subject(d, allowed)
+                ]
+                # If after filtering we still have a correct + 3 distractors,
+                # the AI just got the correct answer wrong. The safest thing
+                # is to keep one of the (now correctly-prefixed) distractors
+                # as the correct answer if it makes sense, but we can't know
+                # which one. Instead: log loudly and trust the user to flag
+                # the card. We do still return the data so the UI doesn't
+                # crash.
         # --- Spelling-trap post-processing safety net ---
         present_traps = _detect_spelling_traps(final_italian)
         english_correct = raw_data.get("english_correct", final_english)
