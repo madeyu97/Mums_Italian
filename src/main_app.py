@@ -1,0 +1,752 @@
+# src/main_app.py
+
+import streamlit as st
+import os
+import random
+import json
+from datetime import date
+from urllib.parse import quote_plus
+
+from srs_engine import get_todays_quiz_batch, process_review
+from ai_prompter import (
+    generate_dictation_exercise,
+    generate_conjugation_drill,
+    generate_cloze_exercise,
+    choose_recall_strategy,
+)
+from audio_engine import create_audio_file
+from db_manager import (
+    flag_word_in_database, get_progress_stats, undo_word_progress,
+    get_more_words, delete_word_from_db, update_word_in_db,
+    mark_word_mastered,
+)
+from speech_engine import transcribe_audio, grade_speech, GRADE_MAP
+from config import LISTENING_PCT, MAX_REVIEWS_PER_DAY, MASTERED_INTERVAL_DAYS, FLUENCY_TARGET
+
+# ==========================================
+# 1. CACHE MANAGEMENT
+# ==========================================
+CACHE_FILE = "session_cache.json"
+
+def load_cached_session():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            if cache.get("date") == str(date.today()):
+                return cache
+        except Exception:
+            pass
+    return None
+
+def save_cached_session():
+    cache = {
+        "date": str(date.today()),
+        "words_due": st.session_state.words_due,
+        "modes": st.session_state.modes,
+        "current_index": st.session_state.current_index,
+        "current_exercise": st.session_state.current_exercise,
+        "audio_path": st.session_state.audio_path,
+        "stage": st.session_state.stage,
+        "shuffled_options": st.session_state.shuffled_options,
+        "user_typed": st.session_state.user_typed,
+        "mcq_correct": st.session_state.mcq_correct,
+        "exercise_history": st.session_state.exercise_history,
+        "audio_history": st.session_state.audio_history,
+        "recall_result": st.session_state.recall_result,
+        "recall_history": st.session_state.recall_history,
+    }
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f)
+
+def clear_cached_session():
+    """Delete the on-disk cache so the next run starts from setup."""
+    if os.path.exists(CACHE_FILE):
+        try:
+            os.remove(CACHE_FILE)
+        except Exception:
+            pass
+
+# ==========================================
+# 2. APP CONFIGURATION
+# ==========================================
+st.set_page_config(page_title="Italian Immersion", page_icon="🇮🇹", layout="centered")
+
+def assign_modes(words):
+    """Assign each card 'listen' or 'recall', then shuffle."""
+    n = len(words)
+    listening_count = round(n * LISTENING_PCT)
+    modes = ['listen'] * listening_count + ['recall'] * (n - listening_count)
+    random.shuffle(modes)
+    return modes
+
+# Midnight reset
+if 'session_date' in st.session_state and st.session_state.session_date != str(date.today()):
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+
+# ==========================================
+# 3. SESSION INITIALISATION — restore from cache OR show setup screen
+# ==========================================
+if 'words_due' not in st.session_state:
+    cached_state = load_cached_session()
+    if cached_state:
+        # Resume an in-progress session
+        for key, value in cached_state.items():
+            if key != "date":
+                st.session_state[key] = value
+        if 'modes' not in st.session_state or not st.session_state.modes:
+            st.session_state.modes = assign_modes(st.session_state.words_due)
+        if 'recall_result' not in st.session_state:
+            st.session_state.recall_result = None
+        if 'recall_history' not in st.session_state:
+            st.session_state.recall_history = {}
+        if 'user_typed' not in st.session_state:
+            st.session_state.user_typed = ""
+        st.session_state.session_date = str(date.today())
+    else:
+        # No cache — show the setup screen
+        st.title("🇮🇹 Italian Immersion Study")
+        stats = get_progress_stats()
+        st.markdown(f"You have **{stats['total']}** words in your vocabulary database.")
+        st.markdown("### How long should today's session be?")
+
+        with st.form("session_setup"):
+            session_size = st.number_input(
+                "Number of questions",
+                min_value=1,
+                max_value=max(1, stats['total']) if stats['total'] > 0 else 100,
+                value=min(MAX_REVIEWS_PER_DAY, stats['total']) if stats['total'] > 0 else MAX_REVIEWS_PER_DAY,
+                step=1,
+                help=f"Pick anywhere from 1 to {stats['total']} (your full vocabulary).",
+            )
+            listen_count = round(session_size * LISTENING_PCT)
+            recall_count = session_size - listen_count
+            st.caption(
+                f"That's roughly **🎧 {listen_count} listening + 🎤 {recall_count} recall** "
+                f"based on your {int(LISTENING_PCT*100)}/{int((1-LISTENING_PCT)*100)} mix."
+            )
+            start = st.form_submit_button("▶️ Start Session", type="primary", use_container_width=True)
+
+        if not start:
+            st.stop()
+
+        # User clicked Start — build the session
+        with st.spinner("Building your session..."):
+            st.session_state.words_due = get_todays_quiz_batch(session_size=int(session_size))
+            st.session_state.modes = assign_modes(st.session_state.words_due)
+            st.session_state.current_index = 0
+            st.session_state.current_exercise = None
+            st.session_state.audio_path = None
+            st.session_state.stage = 1
+            st.session_state.shuffled_options = []
+            st.session_state.user_typed = ""
+            st.session_state.mcq_correct = None
+            st.session_state.exercise_history = {}
+            st.session_state.audio_history = {}
+            st.session_state.recall_result = None
+            st.session_state.recall_history = {}
+            st.session_state.session_date = str(date.today())
+            save_cached_session()
+        st.rerun()
+
+# ==========================================
+# 4. HELPERS
+# ==========================================
+def reset_card_state():
+    st.session_state.current_exercise = None
+    st.session_state.audio_path = None
+    st.session_state.stage = 1
+    st.session_state.shuffled_options = []
+    st.session_state.user_typed = ""
+    st.session_state.mcq_correct = None
+    st.session_state.recall_result = None
+
+def grade_word_and_next(grade):
+    current_word = st.session_state.words_due[st.session_state.current_index]
+    process_review(
+        word_id=current_word['id'],
+        current_interval=current_word['interval'],
+        current_ease=current_word['ease_factor'],
+        grade=grade
+    )
+    st.session_state.current_index += 1
+    reset_card_state()
+    save_cached_session()
+
+def mark_mastered_and_next():
+    """
+    "Already Mastered" override — pushes the current word far into the
+    future and advances. Undo works the same as a normal grade.
+    """
+    current_word = st.session_state.words_due[st.session_state.current_index]
+    mark_word_mastered(current_word['id'], MASTERED_INTERVAL_DAYS)
+    st.session_state.current_index += 1
+    reset_card_state()
+    save_cached_session()
+
+def undo_last_grade():
+    if st.session_state.current_index > 0:
+        prev_index = st.session_state.current_index - 1
+        original_word = st.session_state.words_due[prev_index]
+        undo_word_progress(
+            word_id=original_word['id'],
+            old_next_review_date=original_word['next_review_date'],
+            old_interval=original_word['interval'],
+            old_ease=original_word['ease_factor'],
+            old_review_count=original_word['review_count'],
+            old_priority=original_word.get('priority_weight', 1)
+        )
+        st.session_state.current_index = prev_index
+        idx_str = str(prev_index)
+        st.session_state.current_exercise = st.session_state.exercise_history.get(idx_str)
+        st.session_state.audio_path = st.session_state.audio_history.get(idx_str)
+        if st.session_state.modes[prev_index] == 'recall':
+            st.session_state.recall_result = st.session_state.recall_history.get(idx_str)
+            st.session_state.stage = 2
+        else:
+            st.session_state.stage = 3
+        save_cached_session()
+
+def advance_to_stage(n):
+    st.session_state.stage = n
+    save_cached_session()
+
+def start_new_session():
+    """Wipe everything so the user gets the setup screen again."""
+    clear_cached_session()
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+
+# ==========================================
+# 5. MAIN UI — SHARED HEADER
+# ==========================================
+st.title("🇮🇹 Italian Immersion Study")
+
+# Session-complete screen
+if st.session_state.current_index >= len(st.session_state.words_due):
+    st.success("🎉 Bravissimo! You're all caught up for today.")
+    st.balloons()
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("➕ Do 5 More Words", type="secondary", use_container_width=True):
+            with st.spinner("Fetching more words..."):
+                exclude_ids = [w['id'] for w in st.session_state.words_due]
+                extra_words = get_more_words(exclude_ids, amount=5)
+                if extra_words:
+                    st.session_state.words_due.extend(extra_words)
+                    st.session_state.modes.extend(assign_modes(extra_words))
+                    save_cached_session()
+                    st.rerun()
+                else:
+                    st.warning("You've completely exhausted your database!")
+    with col_b:
+        if st.button("🔄 Start New Session", type="primary", use_container_width=True):
+            start_new_session()
+            st.rerun()
+    st.stop()
+
+current_word = st.session_state.words_due[st.session_state.current_index]
+current_mode = st.session_state.modes[st.session_state.current_index]
+
+# Header row: progress / mode / undo
+total_words = len(st.session_state.words_due)
+col1, col2, col3 = st.columns([3, 1, 1])
+with col1:
+    st.progress((st.session_state.current_index) / total_words)
+    st.caption(f"Reviewing word {st.session_state.current_index + 1} of {total_words}")
+with col2:
+    badge = "🎧 Listen" if current_mode == 'listen' else "🎤 Recall"
+    st.caption(f"**{badge}**")
+with col3:
+    if st.session_state.current_index > 0:
+        if st.button("↩️ Undo", use_container_width=True):
+            undo_last_grade()
+            st.rerun()
+
+st.markdown("---")
+
+# ==========================================
+# 5.5 SIDEBAR
+# ==========================================
+with st.sidebar:
+    st.header("📊 Global Progress")
+    stats = get_progress_stats()
+
+    # ---- Fluency-to-10k indicator ----
+    mastered_count = stats.get('mastered', 0)
+    fluency_pct = (mastered_count / FLUENCY_TARGET) * 100 if FLUENCY_TARGET > 0 else 0
+    # Cap the bar at 1.0 in case someone really does hit 10k
+    bar_value = min(mastered_count / FLUENCY_TARGET, 1.0) if FLUENCY_TARGET > 0 else 0
+
+    st.markdown("#### 🇮🇹 Fluency Progress")
+    # Pick a friendly precision: %, .1f%, or .2f% depending on size
+    if fluency_pct >= 10:
+        pct_str = f"{fluency_pct:.1f}%"
+    elif fluency_pct >= 1:
+        pct_str = f"{fluency_pct:.2f}%"
+    else:
+        pct_str = f"{fluency_pct:.3f}%"
+    st.metric(
+        label=f"Toward {FLUENCY_TARGET:,}-word fluency",
+        value=pct_str,
+        delta=f"{mastered_count:,} / {FLUENCY_TARGET:,} mastered",
+        delta_color="off",
+    )
+    st.progress(bar_value)
+    st.caption(
+        "Rough rule-of-thumb: ~10,000 mastered words ≈ functional fluency. "
+        "Multi-word entries count as one unit."
+    )
+    st.markdown("---")
+    if stats['total'] > 0:
+        unseen_pct = int((stats['unseen'] / stats['total']) * 100)
+        learning_pct = int((stats['learning'] / stats['total']) * 100)
+        mastered_pct = int((stats['mastered'] / stats['total']) * 100)
+        st.metric("Total CSV Vocabulary", stats['total'])
+        st.markdown("---")
+        st.write(f"**👀 Unseen:** {stats['unseen']} words ({unseen_pct}%)")
+        st.progress(stats['unseen'] / stats['total'])
+        st.write(f"**🧠 Learning:** {stats['learning']} words ({learning_pct}%)")
+        st.progress(stats['learning'] / stats['total'])
+        st.write(f"**🏆 Mastered:** {stats['mastered']} words ({mastered_pct}%)")
+        st.progress(stats['mastered'] / stats['total'])
+        st.markdown("---")
+        st.caption("Mastered = pushed 21+ days into the future.")
+
+        st.markdown("---")
+        listen_left = sum(1 for i, m in enumerate(st.session_state.modes)
+                          if i >= st.session_state.current_index and m == 'listen')
+        recall_left = sum(1 for i, m in enumerate(st.session_state.modes)
+                          if i >= st.session_state.current_index and m == 'recall')
+        st.caption(f"This session: 🎧 {listen_left} listening · 🎤 {recall_left} recall")
+        st.caption("Recall auto-routes verbs → conjugation drills, "
+                   "clitics/articles/preps → cloze, rest → free recall.")
+
+        st.markdown("---")
+        if st.button("🔄 End & Start New Session", use_container_width=True):
+            start_new_session()
+            st.rerun()
+    else:
+        st.write("No vocabulary found. Please check your CSV.")
+
+# ==========================================
+# 6. EXERCISE GENERATION (routes by mode + recall sub-mode)
+# ==========================================
+if st.session_state.current_exercise is None:
+    with st.spinner("Generating Italian scenario..."):
+        if current_mode == 'listen':
+            # Listening always uses the standard dictation generator
+            exercise_data = generate_dictation_exercise(current_word)
+            if exercise_data is not None:
+                exercise_data.setdefault("exercise_type", "listen")
+        else:
+            # Recall: route to conjugation drill / cloze / free recall
+            strategy = choose_recall_strategy(current_word)
+            if strategy == 'conjugation':
+                exercise_data = generate_conjugation_drill(current_word)
+                # Fall back to free recall if drill generation fails
+                if exercise_data is None:
+                    logging._silenced = True  # noop; just suppress lint
+                    exercise_data = generate_dictation_exercise(current_word)
+                    if exercise_data is not None:
+                        exercise_data["exercise_type"] = "free"
+            elif strategy == 'cloze':
+                exercise_data = generate_cloze_exercise(current_word)
+                # generate_cloze_exercise already falls back to "free" internally
+                # if the target word isn't found in the generated sentence.
+            else:
+                exercise_data = generate_dictation_exercise(current_word)
+                if exercise_data is not None:
+                    exercise_data["exercise_type"] = "free"
+
+        if exercise_data:
+            st.session_state.current_exercise = exercise_data
+            audio_script = exercise_data['italian']
+            st.session_state.audio_path = create_audio_file(audio_script)
+
+            idx_str = str(st.session_state.current_index)
+            st.session_state.exercise_history[idx_str] = exercise_data
+            st.session_state.audio_history[idx_str] = st.session_state.audio_path
+
+            # MCQ options only matter for the listening flow
+            if current_mode == 'listen' and exercise_data.get("english_distractors"):
+                options = exercise_data['english_distractors'] + [exercise_data['english_correct']]
+                random.shuffle(options)
+                st.session_state.shuffled_options = options
+            else:
+                st.session_state.shuffled_options = []
+            save_cached_session()
+        else:
+            st.error("Failed to generate exercise. Check your API connection.")
+            st.stop()
+
+# ==========================================
+# Reusable renderers
+# ==========================================
+def render_breakdown():
+    ex = st.session_state.current_exercise
+
+    gp = ex.get('grammar_point')
+    if gp and gp.get('structure'):
+        st.markdown("#### 🧠 Grammar Point")
+        st.info(f"**{gp['structure']}**: {gp['explanation']}")
+
+    en = ex.get('expression_note')
+    if en and en.get('expression'):
+        st.markdown("#### 🗣️ Expression / Idiom")
+        st.warning(f"**{en['expression']}**: {en['explanation']}")
+
+    st.markdown("#### 📖 Word Breakdown")
+    words = ex.get('word_breakdown', [])
+    cols_per_row = 3
+    for i in range(0, len(words), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, col in enumerate(cols):
+            if i + j < len(words):
+                word = words[i + j]
+                italian_word = word.get('italian', word.get('chinese', '?'))
+                english_meaning = word.get('english', '')
+                note = word.get('note', '')
+
+                # Italian dictionary links
+                encoded = quote_plus(italian_word)
+                wordref_url = f"https://www.wordreference.com/iten/{encoded}"
+                reverso_url = f"https://context.reverso.net/translation/italian-english/{encoded}"
+                treccani_url = f"https://www.treccani.it/vocabolario/ricerca/{encoded}/"
+
+                with col:
+                    label = f"{italian_word}"
+                    with st.expander(label):
+                        st.write(f"**{english_meaning}**")
+                        if note:
+                            st.caption(note)
+                        stress = word.get('stress', '')
+                        if stress:
+                            st.caption(f"🔤 Stress: **{stress}**")
+                        st.caption(f"Word: {italian_word}")
+                        button_key = f"flag_btn_{st.session_state.current_index}_{i}_{j}_{italian_word}"
+                        if st.button("🚩 Needs Practice", key=button_key):
+                            flag_word_in_database(italian_word)
+                            st.toast(f"Flagged '{italian_word}' for more practice!")
+                        st.markdown("---")
+                        st.markdown(f"📚 [WordReference]({wordref_url})")
+                        st.markdown(f"💬 [Reverso Context]({reverso_url})")
+                        st.markdown(f"🇮🇹 [Treccani]({treccani_url})")
+
+def render_card_settings():
+    st.markdown("---")
+    with st.expander("⚙️ Card Settings (Edit or Delete)"):
+        st.caption("Tweak this word's context to guide the AI, or remove it entirely.")
+        edit_col1, edit_col2, edit_col3 = st.columns(3)
+        with edit_col1:
+            edit_italian = st.text_input("Italian", current_word.get('italian', ''))
+        with edit_col2:
+            edit_english = st.text_input("English", current_word.get('english', ''))
+        with edit_col3:
+            edit_hint = st.text_input("Hint (AI Prompt Hint)", current_word.get('hint', '') or '')
+
+        btn_col1, btn_col2 = st.columns([1, 1])
+        with btn_col1:
+            if st.button("💾 Save & Regenerate Card", use_container_width=True):
+                update_word_in_db(current_word['id'], edit_italian, edit_english, edit_hint)
+                st.session_state.words_due[st.session_state.current_index]['italian'] = edit_italian
+                st.session_state.words_due[st.session_state.current_index]['english'] = edit_english
+                st.session_state.words_due[st.session_state.current_index]['hint'] = edit_hint
+                reset_card_state()
+                save_cached_session()
+                st.rerun()
+        with btn_col2:
+            if st.button("🗑️ Delete Word Permanently", type="secondary", use_container_width=True):
+                delete_word_from_db(current_word['id'])
+                st.session_state.words_due.pop(st.session_state.current_index)
+                st.session_state.modes.pop(st.session_state.current_index)
+                reset_card_state()
+                save_cached_session()
+                st.rerun()
+
+def render_grade_buttons(suggested_grade=None):
+    st.markdown("---")
+    st.markdown("#### Grade yourself (Be honest!):")
+    labels = ["Again (0)\nFailed", "Hard (1)\nStruggled", "Good (2)\nSolid", "Easy (3)\nInstant"]
+    cols = st.columns(4)
+    for i, (col, label) in enumerate(zip(cols, labels)):
+        with col:
+            btn_type = "primary" if i == suggested_grade else "secondary"
+            if st.button(label, use_container_width=True, key=f"grade_{i}", type=btn_type):
+                grade_word_and_next(i)
+                st.rerun()
+
+    # ---- Mastered override ----
+    st.markdown("")  # small visual gap
+    mc1, mc2, mc3 = st.columns([1, 2, 1])
+    with mc2:
+        if st.button(
+            "🏆 Already Mastered — skip future reviews",
+            use_container_width=True,
+            key="mastered_override",
+            help=(
+                f"Marks this word as mastered and won't review it for "
+                f"{MASTERED_INTERVAL_DAYS} days. Use this for words you've "
+                f"known cold for ages and don't want cluttering sessions. "
+                f"You can still undo via the ↩️ Undo button."
+            ),
+        ):
+            mark_mastered_and_next()
+            st.rerun()
+
+
+# ==========================================
+# 7A. LISTENING FLOW
+# ==========================================
+if current_mode == 'listen':
+    st.subheader("Listen & Transcribe:")
+    if st.session_state.audio_path and os.path.exists(st.session_state.audio_path):
+        st.audio(st.session_state.audio_path, format="audio/mp3")
+    else:
+        st.warning("⚠️ The audio engine failed to generate the voice file.")
+        if st.button("🔄 Retry Audio", type="primary"):
+            with st.spinner("Retrying audio..."):
+                audio_script = st.session_state.current_exercise['italian']
+                st.session_state.audio_path = create_audio_file(audio_script)
+                st.session_state.audio_history[str(st.session_state.current_index)] = st.session_state.audio_path
+                save_cached_session()
+                st.rerun()
+
+    # Optional slow replay
+    if st.session_state.audio_path and os.path.exists(st.session_state.audio_path):
+        with st.expander("🐢 Need it slower?"):
+            if st.button("Generate slow version (-25%)", key=f"slow_{st.session_state.current_index}"):
+                with st.spinner("Generating slow audio..."):
+                    slow_path = create_audio_file(
+                        st.session_state.current_exercise['italian'], slow=True
+                    )
+                    if slow_path and os.path.exists(slow_path):
+                        st.audio(slow_path, format="audio/mp3")
+
+    if st.session_state.stage == 1:
+        st.text_input(
+            "Type what you hear (in Italian):",
+            key="typed_input",
+            placeholder="e.g. Ho mangiato la pizza",
+        )
+        if st.button("Submit", type="primary", use_container_width=True):
+            st.session_state.user_typed = st.session_state.typed_input
+            advance_to_stage(2)
+            st.rerun()
+
+    if st.session_state.stage >= 2:
+        st.success(f"**You typed:** {st.session_state.user_typed}")
+
+    if st.session_state.stage == 2:
+        st.markdown("### What does the sentence mean?")
+        st.info("Select the most accurate, nuanced translation:")
+        if not st.session_state.shuffled_options or len(st.session_state.shuffled_options) < 2:
+            st.error("⚠️ The AI failed to generate the multiple-choice options properly.")
+            if st.button("🔄 Regenerate This Word", type="primary"):
+                reset_card_state()
+                save_cached_session()
+                st.rerun()
+        else:
+            selected_meaning = st.radio(
+                "Choose translation:",
+                st.session_state.shuffled_options,
+                index=None,
+                label_visibility="collapsed",
+            )
+            if st.button(
+                "Submit Meaning",
+                type="primary",
+                use_container_width=True,
+                disabled=(selected_meaning is None),
+            ):
+                st.session_state.mcq_correct = (
+                    selected_meaning == st.session_state.current_exercise['english_correct']
+                )
+                advance_to_stage(3)
+                st.rerun()
+
+    if st.session_state.stage == 3:
+        st.markdown("---")
+        st.markdown("### The Solution")
+        if st.session_state.mcq_correct is not None:
+            if st.session_state.mcq_correct:
+                st.success("✅ **Translation:** Correct!")
+            else:
+                st.error("❌ **Translation:** Incorrect.")
+        st.info(f"**Correct Italian:** {st.session_state.current_exercise['italian']}")
+        st.info(f"**Correct English:** {st.session_state.current_exercise['english_correct']}")
+
+        # Spelling comparison: what they typed vs the answer
+        if st.session_state.user_typed:
+            typed_norm = st.session_state.user_typed.strip().lower()
+            answer_norm = st.session_state.current_exercise['italian'].strip().lower()
+            if typed_norm == answer_norm:
+                st.caption("📝 Spelling: **perfect match** ✅")
+            else:
+                st.caption(f"📝 Spelling: not exact — check accents and double consonants")
+
+        render_breakdown()
+        render_card_settings()
+        render_grade_buttons()
+
+
+# ==========================================
+# 7B. RECALL FLOW
+# ==========================================
+elif current_mode == 'recall':
+    ex = st.session_state.current_exercise
+    exercise_type = ex.get('exercise_type', 'free')
+
+    # ------- Prompt header (varies by sub-mode) -------
+    if exercise_type == 'conjugation':
+        st.subheader("🎤 Conjugation Drill")
+        tense  = ex.get('tense', '')
+        person = ex.get('person', '')
+        st.caption(f"Target form: **{tense}**, **{person}**")
+        st.markdown(f"**Translate into Italian:**")
+        st.info(f"_{ex['english_prompt']}_")
+        st.caption(
+            f"Infinitive: **{ex.get('infinitive', current_word.get('italian', ''))}** "
+            f"({current_word.get('english', '')})"
+        )
+
+    elif exercise_type == 'cloze':
+        st.subheader("🎤 Fill the Blank (Cloze)")
+        st.markdown("**Read the sentence below and SPEAK the missing word:**")
+        st.info(ex.get('cloze_display', ex.get('italian', '')))
+        st.caption(f"Meaning: _{ex['english_correct']}_")
+        # Optional: let them hear the full sentence first
+        if st.session_state.audio_path and os.path.exists(st.session_state.audio_path):
+            with st.expander("🔊 Hear the full sentence first"):
+                st.audio(st.session_state.audio_path, format="audio/mp3")
+                st.caption("Tip: try to say the blank without listening, then check.")
+
+    else:
+        # Free recall (original behaviour)
+        st.subheader("🎤 Speak the Italian:")
+        st.markdown(f"**Say this in Italian:** _{ex['english_correct']}_")
+        target_meaning = current_word.get('english', '')
+        if target_meaning:
+            st.caption(f"Target word meaning: _{target_meaning}_")
+
+    # ------- Stage 1: record + submit (shared across sub-modes) -------
+    if st.session_state.stage == 1:
+        st.info("Tap to record, speak, then submit.")
+        audio_value = st.audio_input("🎙️ Your attempt", key=f"mic_{st.session_state.current_index}")
+
+        if audio_value is not None:
+            if st.button("✅ Submit Recording", type="primary", use_container_width=True):
+                audio_bytes = audio_value.getvalue()
+                with st.spinner("Transcribing with Whisper..."):
+                    transcription = transcribe_audio(audio_bytes)
+                if transcription is None:
+                    st.error("Transcription failed — try again.")
+                    st.stop()
+
+                # Build the right grading call based on sub-mode
+                drill_context = None
+                if exercise_type == 'conjugation':
+                    grade_expected_italian = ex.get('italian', '')
+                    grade_expected_english = ex.get('english_prompt', ex.get('english_correct', ''))
+                    drill_context = {
+                        "type": "conjugation",
+                        "infinitive": ex.get('infinitive', ''),
+                        "tense":      ex.get('tense', ''),
+                        "person":     ex.get('person', ''),
+                        "expected_form": ex.get('expected_form', ''),
+                    }
+                elif exercise_type == 'cloze':
+                    grade_expected_italian = ex.get('cloze_blank', '')
+                    grade_expected_english = ex.get('english_correct', '')
+                    drill_context = {
+                        "type": "cloze",
+                        "target_word":     ex.get('cloze_blank', ''),
+                        "full_sentence":   ex.get('italian', ''),
+                        "blanked_display": ex.get('cloze_display', ''),
+                    }
+                else:
+                    grade_expected_italian = ex.get('italian', '')
+                    grade_expected_english = ex.get('english_correct', '')
+
+                with st.spinner("Grading your attempt..."):
+                    grading = grade_speech(
+                        expected_italian=grade_expected_italian,
+                        expected_english=grade_expected_english,
+                        transcribed_text=transcription['text'],
+                        hint=current_word.get('hint', '') or '',
+                        drill_context=drill_context,
+                    )
+                if grading is None:
+                    st.error("Grading failed — try again, or skip to grade yourself manually.")
+                    st.stop()
+                st.session_state.recall_result = {
+                    "transcription": transcription,
+                    "grading": grading,
+                }
+                st.session_state.recall_history[str(st.session_state.current_index)] = st.session_state.recall_result
+                advance_to_stage(2)
+                st.rerun()
+
+        with st.expander("Can't record right now?"):
+            if st.button("⏭️ Skip recording and self-grade"):
+                st.session_state.recall_result = None
+                advance_to_stage(2)
+                st.rerun()
+
+    # ------- Stage 2: solution + grading + breakdown (shared) -------
+    if st.session_state.stage == 2:
+        result = st.session_state.recall_result
+        st.markdown("---")
+        st.markdown("### The Solution")
+
+        if exercise_type == 'conjugation':
+            st.success(f"**Expected form:** `{ex.get('expected_form', '')}`")
+            st.info(f"**Full sentence:** {ex.get('italian', '')}")
+            st.caption(f"*(Meaning: {ex.get('english_prompt', ex.get('english_correct', ''))})*")
+            form_expl = ex.get('form_explanation', '')
+            if form_expl:
+                st.caption(f"📖 {form_expl}")
+
+        elif exercise_type == 'cloze':
+            st.success(f"**Missing word:** `{ex.get('cloze_blank', '')}`")
+            st.info(f"**Full sentence:** {ex.get('italian', '')}")
+            st.caption(f"*(Meaning: {ex['english_correct']})*")
+
+        else:
+            st.info(f"**Correct Italian:** {ex.get('italian', '')}")
+            st.caption(f"*(Meaning: {ex['english_correct']})*")
+
+        if st.session_state.audio_path and os.path.exists(st.session_state.audio_path):
+            st.caption("How it should sound:")
+            st.audio(st.session_state.audio_path, format="audio/mp3")
+
+        if result is not None:
+            grading = result['grading']
+            transcription = result['transcription']
+
+            st.markdown("#### 📝 Whisper heard:")
+            st.code(transcription['text'] or "(nothing audible)", language=None)
+
+            s1, s2, s3 = st.columns(3)
+            with s1: st.metric("Vocab", f"{grading['vocab_score']}/10")
+            with s2: st.metric("Grammar", f"{grading['grammar_score']}/10")
+            with s3: st.metric("Pronunciation*", f"{grading['pronunciation_score']}/10")
+            st.caption(
+                "*Pronunciation is inferred from Whisper transcription fidelity — "
+                "it can't grade open/closed vowels or double-consonant crispness directly."
+            )
+
+            st.markdown("#### 💬 Feedback")
+            st.write(grading['feedback'])
+
+            suggested = GRADE_MAP.get(grading['overall_grade'], 2)
+            st.caption(f"Suggested SRS grade: **{grading['overall_grade']}** (you can override below).")
+        else:
+            suggested = None
+            st.caption("No recording submitted — grade yourself below.")
+
+        render_breakdown()
+        render_card_settings()
+        render_grade_buttons(suggested_grade=suggested)

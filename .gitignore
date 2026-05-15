@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+session_cache.json
+data/current_audio.mp3
+data/user_progress.db
+.DS_Store
+.venv/
+venv/
