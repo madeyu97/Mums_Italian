@@ -45,6 +45,21 @@ def init_db():
             priority_weight INTEGER DEFAULT 1
         )
     ''')
+    # Ensure a unique constraint on 'italian' so batched ON CONFLICT works.
+    # Wrapped in a DO block so it's a no-op if the constraint already exists
+    # (older versions of Postgres don't support IF NOT EXISTS on constraints).
+    cursor.execute('''
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'vocab_progress_italian_key'
+            ) THEN
+                ALTER TABLE vocab_progress
+                ADD CONSTRAINT vocab_progress_italian_key UNIQUE (italian);
+            END IF;
+        END
+        $$;
+    ''')
     conn.commit()
     conn.close()
     logging.info("Supabase database initialized successfully.")
@@ -53,6 +68,10 @@ def import_vocab_from_csv():
     """
     Expects italian_vocab.csv with columns:
         Italian, English, Hint (optional)
+
+    Performs a single batched INSERT with ON CONFLICT DO NOTHING so
+    duplicates are skipped at the database level. Handles 10k+ rows
+    in seconds instead of minutes.
     """
     if not VOCAB_CSV_PATH.exists():
         logging.warning("CSV file not found. Skipping import.")
@@ -82,35 +101,47 @@ def import_vocab_from_csv():
     df = df.replace('', pd.NA).dropna(subset=['Italian', 'English'])
     df['Hint'] = df['Hint'].fillna('')
 
+    if df.empty:
+        logging.info("CSV had no valid rows after cleaning. Nothing to import.")
+        return
+
+    today_str = date.today().isoformat()
+    rows = [
+        (row['Italian'], row['English'], row['Hint'], today_str, today_str)
+        for _, row in df.iterrows()
+    ]
+
+    # Count current rows so we can report how many were actually new.
     conn = get_connection()
     cursor = conn.cursor()
-    new_words_added = 0
-    skipped_words = []
-    today_str = date.today().isoformat()
+    cursor.execute("SELECT COUNT(*) FROM vocab_progress")
+    before_count = cursor.fetchone()[0]
 
-    for index, row in df.iterrows():
-        cursor.execute('''
-            SELECT id FROM vocab_progress WHERE italian = %s
-        ''', (row['Italian'],))
-        exists = cursor.fetchone()
-
-        if not exists:
-            cursor.execute('''
-                INSERT INTO vocab_progress
-                (italian, english, hint, date_added, next_review_date)
-                VALUES (%s, %s, %s, %s, %s)
-            ''', (row['Italian'], row['English'], row['Hint'], today_str, today_str))
-            new_words_added += 1
-        else:
-            skipped_words.append(row['Italian'])
-
+    # Single batched insert; relies on the UNIQUE constraint on italian
+    # added in init_db(). ON CONFLICT DO NOTHING skips existing rows.
+    psycopg2.extras.execute_values(
+        cursor,
+        '''
+        INSERT INTO vocab_progress
+            (italian, english, hint, date_added, next_review_date)
+        VALUES %s
+        ON CONFLICT (italian) DO NOTHING
+        ''',
+        rows,
+        page_size=1000,
+    )
     conn.commit()
+
+    cursor.execute("SELECT COUNT(*) FROM vocab_progress")
+    after_count = cursor.fetchone()[0]
     conn.close()
 
+    new_words_added = after_count - before_count
+    skipped = len(rows) - new_words_added
     if new_words_added > 0:
         logging.info(f"Imported {new_words_added} new words to Supabase.")
-    if skipped_words:
-        logging.info(f"Skipped {len(skipped_words)} exact duplicate rows.")
+    if skipped > 0:
+        logging.info(f"Skipped {skipped} rows already in database.")
 
 def flag_word_in_database(italian_word):
     conn = get_connection()
