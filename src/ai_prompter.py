@@ -624,6 +624,11 @@ def _find_main_verb_and_subjects(italian_text: str):
     for tok in tokens[:6]:
         if not tok or tok in _PRE_VERB_SKIP:
             continue
+        # Verb-noun ambiguous forms (vivo, canto, gioco, lavoro, etc.):
+        # could be either a 1sg verb or a noun/adjective. Treat as
+        # NOT a verb so we don't generate false positives.
+        if tok in _VERB_NOUN_AMBIGUOUS:
+            continue
         subjects = _looks_like_finite_verb(tok)
         if subjects is not None:
             return (tok, subjects)
@@ -768,6 +773,48 @@ def _has_piacere_family_verb(italian_text: str):
     tokens = [t.lower().strip(".,;:!?\"'’()[]")
               for t in _re.split(r"\s+", italian_text.strip()) if t.strip()]
     return any(tok in _PIACERE_FAMILY for tok in tokens)
+
+
+# Words that have an identical-spelling noun/adjective AND a 1sg verb form.
+# When these appear, we can't tell from spelling alone which sense is meant,
+# so the safe move is to NOT treat them as verbs at all.
+#
+# Common offenders:
+#   vivo    = "I live" OR "alive/live"     (musica dal vivo = live music)
+#   canto   = "I sing" OR "song/corner"
+#   gioco   = "I play" OR "game"
+#   lavoro  = "I work" OR "job/work"
+#   aiuto   = "I help" OR "help" (noun)
+#   bacio   = "I kiss" OR "a kiss"
+#   sogno   = "I dream" OR "a dream"
+#   pago    = "I pay" OR "pay" (noun, rare)
+#   passo   = "I pass" OR "step"
+#   tocco   = "I touch" OR "touch" (noun)
+#   pranzo  = "I lunch" OR "lunch"
+#   cena    = "I dine" (3sg actually) OR "dinner" — tricky
+#   regalo  = "I gift" OR "a gift"
+#   abito   = "I live/dwell" OR "outfit/dress"
+#   conto   = "I count" OR "bill/account"
+#   fumo    = "I smoke" OR "smoke"
+#   gusto   = "I taste" OR "taste"
+#   inizio  = "I begin" OR "beginning"
+#   incontro = "I meet" OR "a meeting"
+#   ritorno = "I return" OR "return" (noun)
+#   saluto  = "I greet" OR "a greeting"
+#   sguardo = (not a verb)
+#   suono   = "I play (instrument)/sound" OR "sound"
+#   tiro    = "I throw/pull" OR "throw/draw"
+#   uso     = "I use" OR "use" (noun)
+_VERB_NOUN_AMBIGUOUS = {
+    "vivo", "canto", "gioco", "lavoro", "aiuto", "bacio", "sogno",
+    "passo", "tocco", "pranzo", "regalo", "abito", "conto", "fumo",
+    "gusto", "inizio", "incontro", "ritorno", "saluto", "suono",
+    "tiro", "uso", "vino",  # vino isn't a verb but listed for safety
+    "viaggio", "studio", "amo",  # amo could be hook OR "I love"
+    "porto", "porto",  # I carry OR port
+    "credo", "credo",  # I believe OR creed
+    "dubbio",  # (only noun, listed for safety)
+}
 
 
 # ----------------------------------------------------------------------
@@ -1209,9 +1256,16 @@ def generate_dictation_exercise(target_word_dict):
         # Verifies that the English translation's subject pronoun matches the
         # person of the main Italian verb. Catches the LLM's most common
         # generation bug: e.g. labelling "Sono a casa" as "He/She is at home".
-        agreement_ok, allowed_subjects, detected_verb = _verify_subject_agreement(
-            final_italian, english_correct
-        )
+        #
+        # SKIP this entirely for locked phrases (multi-word CSV entries like
+        # "musica dal vivo", "in bocca al lupo") — those are fixed
+        # expressions, not sentences with a subject.
+        if is_locked_phrase:
+            agreement_ok, allowed_subjects, detected_verb = (True, None, None)
+        else:
+            agreement_ok, allowed_subjects, detected_verb = _verify_subject_agreement(
+                final_italian, english_correct
+            )
         if not agreement_ok and allowed_subjects:
             logging.warning(
                 f"Verb/subject mismatch detected: Italian verb '{detected_verb}' "
