@@ -1200,6 +1200,11 @@ def generate_dictation_exercise(target_word_dict):
                 wb_entry["stress"] = item["stress"]
             word_breakdown.append(wb_entry)
 
+        # Extract the translation fields up front so all the downstream
+        # safety nets can reference them.
+        english_correct = raw_data.get("english_correct", final_english)
+        english_distractors = raw_data.get("english_distractors", [])
+
         # --- Verb/pronoun agreement safety net (bulletproof verifier) ---
         # Verifies that the English translation's subject pronoun matches the
         # person of the main Italian verb. Catches the LLM's most common
@@ -1219,10 +1224,9 @@ def generate_dictation_exercise(target_word_dict):
                 d for d in english_distractors
                 if _english_starts_with_subject(d, allowed_subjects)
             ]
+
         # --- Spelling-trap post-processing safety net ---
         present_traps = _detect_spelling_traps(final_italian)
-        english_correct = raw_data.get("english_correct", final_english)
-        english_distractors = raw_data.get("english_distractors", [])
 
         # Hedge English pronouns on 3rd-person verbs without explicit subject.
         # Heuristic: starts with "He " or "She " and Italian has no Lui/Lei/Egli/Ella
