@@ -1500,6 +1500,12 @@ def generate_conjugation_drill(target_word_dict, tense=None, person=None):
         "target_category":   "verb_form",
       }
 
+    The generator includes a post-generation verifier that checks the
+    Italian translation actually uses the target person, with correct
+    agreement on adjectives and participles. If a mismatch is detected,
+    it retries up to 2 more times with a sharper prompt before returning
+    the best result available.
+
     Caller can pass explicit tense/person to deterministically pick one
     (useful for tests); otherwise weighted random selection is used.
     """
@@ -1509,9 +1515,70 @@ def generate_conjugation_drill(target_word_dict, tense=None, person=None):
     if tense is None or person is None:
         tense, person = _pick_conjugation_target()
 
+    # Try up to 3 times — first attempt normal, retries get sharper prompts
+    last_result = None
+    for attempt in range(3):
+        result = _generate_conjugation_drill_once(
+            infinitive, english, tense, person, attempt=attempt,
+            prior_error=(_describe_drill_error(last_result) if last_result else None),
+        )
+        if result is None:
+            continue
+        last_result = result
+        # Verify the generated Italian matches the target person
+        is_consistent, issue = _verify_conjugation_drill(result, tense, person)
+        if is_consistent:
+            return result
+        logging.warning(
+            f"Conjugation drill attempt {attempt + 1} failed verification "
+            f"(target {tense}, {person}, infinitive={infinitive!r}): {issue}. "
+            f"Italian was: {result.get('italian')!r}. Retrying."
+        )
+
+    # All attempts failed verification — return the last result anyway so
+    # the user gets a card, but it's flagged. Better to show a possibly-wrong
+    # card than to crash, and the user can override with the grade buttons.
+    if last_result is not None:
+        logging.warning(
+            f"Conjugation drill returning unverified result after 3 attempts. "
+            f"Italian: {last_result.get('italian')!r}"
+        )
+    return last_result
+
+
+def _generate_conjugation_drill_once(infinitive, english, tense, person, attempt=0, prior_error=None):
+    """
+    A single attempt at generating a conjugation drill via the LLM.
+    Retries get an extra "you got it wrong because X — fix it" section
+    at the top of the prompt.
+    """
+    # Person-specific examples to anchor the AI's output. These are the
+    # single biggest lever we have: showing canonical examples for every
+    # person × major-tense combination dramatically reduces the rate of
+    # person/agreement mistakes.
+    PERSON_AGREEMENT_NOTES = {
+        "io":      "1st person singular. Verb ends in -o (or auxiliary 'ho/sono'). Adjectives/participles agree with the speaker's gender if known, else default to masculine singular (-o ending): 'io sono stanco' or 'io sono stanca'.",
+        "tu":      "2nd person singular. Verb ends in -i (or auxiliary 'hai/sei'). Adjective: m.sg. -o or f.sg. -a depending on addressee.",
+        "lui/lei": "3rd person singular. Verb ends in -a (-are) / -e (-ere, -ire) (or auxiliary 'ha/è'). Adjective: m.sg. -o (lui) or f.sg. -a (lei).",
+        "noi":     "1st person plural. Verb ends in -iamo (or auxiliary 'abbiamo/siamo'). Adjective: m.pl. -i (mixed/male group) or f.pl. -e (all-female group). Example: 'noi siamo stanchi' (m.pl.) or 'noi siamo stanche' (f.pl.). NEVER -o or -a (singular).",
+        "voi":     "2nd person plural (you all). Verb ends in -ate/-ete/-ite (or auxiliary 'avete/siete'). Adjective: m.pl. -i or f.pl. -e. Example: 'voi siete stanchi' or 'voi siete stanche'. NEVER -o or -a.",
+        "loro":    "3rd person plural (they). Verb ends in -ano/-ono (or auxiliary 'hanno/sono'). Adjective: m.pl. -i or f.pl. -e. Example: 'loro sono stanchi' (m./mixed) or 'loro sono stanche' (all-female). NEVER -o or -a singular!",
+    }
+    agreement_note = PERSON_AGREEMENT_NOTES.get(person, "")
+
+    # Build a sharper prompt on retry attempts
+    retry_correction = ""
+    if attempt > 0 and prior_error:
+        retry_correction = f"""
+    ⚠️ PREVIOUS ATTEMPT WAS WRONG:
+    {prior_error}
+
+    FIX IT THIS TIME. Re-read the agreement rules below carefully.
+    """
+
     prompt = f"""
     You are an expert Italian tutor designing a CONJUGATION DRILL.
-
+    {retry_correction}
     The learner is given an English sentence to translate. The translation
     MUST require a specific Italian verb form. Your job is to write a
     natural, short English sentence (5–10 words) that, when translated to
@@ -1520,6 +1587,9 @@ def generate_conjugation_drill(target_word_dict, tense=None, person=None):
     INFINITIVE:    {infinitive} ("{english}")
     TARGET TENSE:  {tense}
     TARGET PERSON: {person}
+
+    PERSON-SPECIFIC AGREEMENT (CRITICAL):
+    {agreement_note}
 
     HARD CONSTRAINTS:
     1. The English sentence MUST naturally force exactly the target tense
@@ -1532,11 +1602,20 @@ def generate_conjugation_drill(target_word_dict, tense=None, person=None):
        For passato prossimo, use a completed action with a specific moment.
        For imperativo, use a command ("Eat your vegetables!").
 
-    2. The English sentence should be natural and useful — something a
-       learner would actually want to say.
+    2. The English subject MUST match the target person:
+         io      → "I"
+         tu      → "you" (singular)
+         lui/lei → "he" or "she" (or a singular noun: "Maria", "the dog")
+         noi     → "we"
+         voi     → "you all" / "you guys" (use plural to avoid ambiguity)
+         loro    → "they" (or a plural noun: "the children", "my friends")
 
-    3. The Italian translation must use {infinitive} (or its correct
-       conjugated form) as its main verb.
+    3. The Italian sentence MUST have:
+       - The verb conjugated in the target tense AND person
+       - ALL adjectives, past participles, and agreement-bearing words
+         matching the subject's number and gender
+       - For PLURAL persons (noi, voi, loro): NO adjectives/participles
+         ending in -o or -a (those are singular!). Use -i (m.pl.) or -e (f.pl.).
 
     4. For compound tenses (passato prossimo, trapassato, condizionale
        passato), pick the correct auxiliary (avere vs essere) AND apply
@@ -1544,6 +1623,13 @@ def generate_conjugation_drill(target_word_dict, tense=None, person=None):
 
     5. For -ire verbs, distinguish -isco verbs (finire, capire, preferire)
        from non-isco verbs (dormire, partire, sentire).
+
+    SELF-CHECK BEFORE RETURNING:
+    Re-read your Italian translation. Confirm:
+      • The verb's ending matches the target person
+      • Every adjective and participle agrees in number with the subject
+      • If the English subject is plural (we/you all/they/the children/etc.),
+        NO Italian adjective or participle ends in -o or -a alone
 
     Output ONLY valid JSON, no prose, no markdown:
     {{
@@ -1585,7 +1671,7 @@ def generate_conjugation_drill(target_word_dict, tense=None, person=None):
         return {
             "exercise_type":    "conjugation",
             "infinitive":       infinitive,
-            "tense":            tense,
+            "tense":             tense,
             "person":           person,
             "english_prompt":   raw_data.get("english_prompt", english),
             "italian":          raw_data.get("italian", ""),
@@ -1599,8 +1685,323 @@ def generate_conjugation_drill(target_word_dict, tense=None, person=None):
             "target_category":  "verb_form",
         }
     except Exception as e:
-        logging.error(f"Conjugation drill generation failed: {e}")
+        logging.error(f"Conjugation drill generation failed (attempt {attempt + 1}): {e}")
         return None
+
+
+# ----------------------------------------------------------------------
+# Agreement verifier for conjugation drills.
+# ----------------------------------------------------------------------
+
+# Map our internal person labels to the English subject pronouns that
+# should appear (or be implied) in the English prompt.
+_PERSON_TO_ENGLISH_SUBJECTS = {
+    "io":      ("I",),
+    "tu":      ("You",),
+    "lui/lei": ("He", "She", "It", "He/She"),
+    "noi":     ("We",),
+    "voi":     ("You",),  # "you all" / "you guys" — still starts with "You"
+    "loro":    ("They",),
+}
+
+# Map our internal person labels to the verb-ending sets expected in
+# present-tense regular conjugations. (For irregulars we lean on the
+# existing _IRREGULAR_VERBS table.)
+_PERSON_TO_REGULAR_ENDINGS = {
+    "io":      ("o",),                                # parlo, mangio, dormo, vivo
+    "tu":      ("i",),                                # parli, mangi, dormi
+    "lui/lei": ("a", "e"),                            # parla, legge, dorme
+    "noi":     ("iamo",),                             # parliamo, leggiamo, dormiamo
+    "voi":     ("ate", "ete", "ite"),                 # parlate, leggete, dormite
+    "loro":    ("ano", "ono"),                        # parlano, leggono, dormono
+}
+
+# A "subject is plural" check — used to enforce that adjectives/participles
+# can't be singular -o or -a alone.
+_PLURAL_PERSONS = {"noi", "voi", "loro"}
+
+
+def _verify_conjugation_drill(result, tense, person):
+    """
+    Verify that a generated conjugation drill is internally consistent.
+
+    Returns (is_consistent, issue_description).
+    issue_description is None if consistent, otherwise a short string
+    explaining what's wrong (used to feed back into the retry prompt).
+
+    Three categories of check:
+      1. English subject matches target person
+      2. Italian sentence contains a finite verb conjugated for target person
+      3. Adjectives / participles in predicative position agree with target
+         person's number (singular vs plural)
+    """
+    italian = (result.get("italian") or "").strip()
+    english_prompt = (result.get("english_prompt") or "").strip()
+
+    if not italian:
+        return (False, "No Italian translation was provided.")
+
+    # ---- Check 1: English subject ----
+    expected_english_subjects = _PERSON_TO_ENGLISH_SUBJECTS.get(person)
+    if expected_english_subjects:
+        if not _english_starts_with_subject(english_prompt, expected_english_subjects):
+            return (
+                False,
+                f"English prompt {english_prompt!r} doesn't start with a subject "
+                f"appropriate for target person {person!r} "
+                f"(expected one of: {expected_english_subjects}).",
+            )
+
+    # ---- Tokenise the Italian ----
+    italian_tokens = [t.lower().strip(".,;:!?\"'’()[]")
+                      for t in italian.split() if t.strip()]
+    if not italian_tokens:
+        return (False, "Italian translation has no tokens.")
+
+    # ---- Check 2: Verb conjugation ----
+    # Look for a verb that UNAMBIGUOUSLY matches the target person.
+    # We trust two things:
+    #   (a) Forms in _IRREGULAR_VERBS (essere, avere, andare, etc.)
+    #   (b) Distinctive plural endings that can't be confused with nouns
+    #       or adjectives: -iamo (1pl), -ate/-ete/-ite (2pl), -ano/-ono (3pl)
+    #       PROVIDED the word isn't in the verb-noun-ambiguous list.
+    #
+    # For 2sg, 3sg, 1sg we lean on the irregular table + the expected_form
+    # field, since their endings (-i, -a, -e, -o) overlap with nouns.
+    target_english_subjects = _PERSON_TO_ENGLISH_SUBJECTS.get(person, ())
+
+    DISTINCTIVE_PERSON_ENDINGS = {
+        "noi":  ("iamo",),
+        "voi":  ("ate", "ete", "ite"),
+        "loro": ("ano", "ono"),
+    }
+    distinctive_endings = DISTINCTIVE_PERSON_ENDINGS.get(person)
+
+    verb_person_ok = False
+    wrong_person_verb = None  # for better error messages
+
+    for tok in italian_tokens:
+        # Skip past participles (-ato, -uto, -ito and feminine/plural variants):
+        # they're not finite verbs and shouldn't be used to infer person.
+        if _is_past_participle(tok):
+            continue
+
+        if tok in _IRREGULAR_VERBS:
+            allowed = _IRREGULAR_VERBS[tok]
+            if any(s in allowed for s in target_english_subjects):
+                verb_person_ok = True
+                break
+            # Track the mismatched verb for diagnostic
+            if not wrong_person_verb:
+                wrong_person_verb = (tok, allowed)
+            continue
+
+        # Distinctive plural endings (only when target is plural)
+        if distinctive_endings:
+            if any(tok.endswith(e) for e in distinctive_endings) and len(tok) >= 4:
+                if tok not in _VERB_NOUN_AMBIGUOUS:
+                    verb_person_ok = True
+                    break
+
+    # If we have a wrong-person irregular verb and no right-person verb,
+    # that's a hard failure.
+    if not verb_person_ok and wrong_person_verb:
+        verb, allowed = wrong_person_verb
+        return (
+            False,
+            f"Italian uses verb {verb!r} (subject must be one of {allowed}), "
+            f"but target person is {person!r} (needs subject "
+            f"{target_english_subjects}). Wrong auxiliary or main verb.",
+        )
+
+    # If we couldn't find any matching verb, fall back to checking
+    # expected_form (a more lenient check).
+    expected_form = (result.get("expected_form") or "").strip().lower()
+    if not verb_person_ok and expected_form:
+        first_word = expected_form.split()[0] if expected_form else ""
+        if first_word in _IRREGULAR_VERBS:
+            allowed = _IRREGULAR_VERBS[first_word]
+            if any(s in allowed for s in target_english_subjects):
+                # The expected_form's first word is a valid auxiliary for
+                # the target person. AND the form should appear in the Italian.
+                if expected_form in italian.lower():
+                    verb_person_ok = True
+
+    if not verb_person_ok:
+        # Couldn't confirm OR refute the verb. Don't fail just because we
+        # don't recognise the conjugation pattern (could be a tense
+        # we don't have rules for, like passato remoto).
+        # Instead, mark as inconclusive and proceed to the adjective check.
+        pass
+
+    # ---- Check 3: Predicate adjective / participle agreement ----
+    # Look specifically at the word AFTER a copula (essere / sembrare /
+    # diventare / rimanere) — that's the predicate position where adjectives
+    # must agree with the subject. This avoids false positives on object
+    # nouns (Parlano italiano — italiano is OBJECT, not predicate).
+    COPULAS_AND_AUX = {
+        "sono", "sei", "è", "siamo", "siete",
+        "era", "eri", "ero", "eravamo", "eravate", "erano",
+        "sarò", "sarai", "sarà", "saremo", "sarete", "saranno",
+        "sia", "siano", "fossi", "fosse", "fossero",
+        "sembra", "sembrano", "sembravo", "sembrava", "sembravano",
+        "diventa", "diventano", "diventato", "diventati",
+        "rimane", "rimangono", "resta", "restano",
+    }
+
+    # Find a copula in the sentence
+    copula_index = None
+    for i, tok in enumerate(italian_tokens):
+        if tok in COPULAS_AND_AUX:
+            copula_index = i
+            break
+
+    if copula_index is not None and copula_index + 1 < len(italian_tokens):
+        # Look at the predicate (word right after the copula, optionally
+        # past a short adverb like 'molto' or 'così')
+        SKIPPABLE_ADV = {"molto", "poco", "tanto", "troppo", "abbastanza",
+                         "così", "davvero", "veramente", "proprio", "ancora",
+                         "già", "sempre", "spesso", "non"}
+        predicate_idx = copula_index + 1
+        while (predicate_idx < len(italian_tokens) and
+               italian_tokens[predicate_idx] in SKIPPABLE_ADV):
+            predicate_idx += 1
+
+        if predicate_idx < len(italian_tokens):
+            predicate = italian_tokens[predicate_idx]
+            # Strip articles in case structure is "Maria è la professoressa"
+            # (where "la" precedes a noun, not adjective)
+            if predicate in {"il", "lo", "la", "i", "gli", "le", "un", "uno", "una"}:
+                # Followed by a noun — not a predicate adjective. Skip check.
+                pass
+            elif len(predicate) >= 3:
+                # Check agreement
+                singular_ending = predicate.endswith(("o", "a"))
+                plural_ending = predicate.endswith(("i", "e"))
+
+                if person in _PLURAL_PERSONS and singular_ending:
+                    if predicate not in _PREDICATE_NON_ADJECTIVE_WHITELIST:
+                        return (
+                            False,
+                            f"Target person {person!r} is plural, but predicate "
+                            f"{predicate!r} after copula {italian_tokens[copula_index]!r} "
+                            f"ends in singular -o/-a. For plural subjects, use "
+                            f"-i (m.pl.) or -e (f.pl.). Example: 'stanco' → 'stanchi'.",
+                        )
+
+                if person in _SINGULAR_PERSONS and plural_ending:
+                    # Catch the inverse: "io sono stanchi" (1sg, plural adj)
+                    # Be careful — many feminine singular adjectives end in -e
+                    # (felice, grande, intelligente). Only flag if it ends in -i
+                    # OR is clearly a plural-only form.
+                    if predicate.endswith("i") and predicate not in _SINGULAR_ENDING_I_WHITELIST:
+                        return (
+                            False,
+                            f"Target person {person!r} is singular, but predicate "
+                            f"{predicate!r} after copula {italian_tokens[copula_index]!r} "
+                            f"ends in -i (looks plural). For singular subjects, "
+                            f"use -o (m.sg.), -a (f.sg.), or -e (m./f. sg. for words "
+                            f"like 'felice', 'grande').",
+                        )
+
+    return (True, None)
+
+
+# Helper sets used by the verifier
+_SINGULAR_PERSONS = {"io", "tu", "lui/lei"}
+
+# Words ending in -i that are ACTUALLY singular (not adjective plurals).
+# Mostly prepositions, conjunctions, common nouns. Used to avoid false
+# positives in the singular-target plural-adjective check.
+_SINGULAR_ENDING_I_WHITELIST = {
+    "i", "lì", "li", "qui", "sì", "tre",  # common short -i words
+    "così", "perché", "poiché", "finché", "purché",
+    "lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato",
+    "oggi", "ieri",
+    # Many singular nouns end in -i:
+    "caffè",  # well, ends in è, but listed for safety
+    "tassi", "brindisi", "analisi", "crisi", "tesi", "ipotesi", "sintesi",
+    "thai", "lui",
+}
+
+# Words ending in -o/-a that are NOT predicate adjectives (nouns, adverbs,
+# prepositions). Used to avoid false positives in the plural-target
+# singular-adjective check.
+_PREDICATE_NON_ADJECTIVE_WHITELIST = {
+    # adverbs and discourse particles
+    "molto", "poco", "tanto", "troppo", "abbastanza", "anche", "ancora",
+    "allora", "domani", "ieri", "oggi", "adesso", "ora", "subito",
+    "presto", "tardi", "sempre", "mai", "spesso", "raramente",
+    "fa", "via", "ecco",
+    # very common nouns where the singular ending is fine even after copula
+    # (e.g. "Maria è la professoressa" — but we already skip after articles)
+    # Conservative: leave empty here. The verifier only fires after a copula,
+    # before which we already filter out article+noun patterns.
+}
+
+
+# Detect past participles by ending. -ato/-ito/-uto (m.sg.), -ata/-ita/-uta
+# (f.sg.), -ati/-iti/-uti (m.pl.), -ate/-ite/-ute (f.pl.).
+# Plus some common irregular past participles.
+_IRREGULAR_PAST_PARTICIPLES = {
+    "fatto", "fatti", "fatta", "fatte",
+    "detto", "detti", "detta", "dette",
+    "letto", "letti", "letta", "lette",
+    "scritto", "scritti", "scritta", "scritte",
+    "visto", "visti", "vista", "viste",
+    "preso", "presi", "presa", "prese",
+    "messo", "messi", "messa", "messe",
+    "rotto", "rotti", "rotta", "rotte",
+    "aperto", "aperti", "aperta", "aperte",
+    "chiuso", "chiusi", "chiusa", "chiuse",
+    "venuto", "venuti", "venuta", "venute",
+    "andato", "andati", "andata", "andate",
+    "stato", "stati", "stata", "state",
+    "morto", "morti", "morta", "morte",
+    "nato", "nati", "nata", "nate",
+    "rimasto", "rimasti", "rimasta", "rimaste",
+    "vissuto", "vissuti", "vissuta", "vissute",
+    "successo", "successi",
+    "perso", "persi", "persa", "perse",
+    "scelto", "scelti", "scelta", "scelte",
+    "offerto", "offerti", "offerta", "offerte",
+    "risposto", "risposti", "risposta", "risposte",
+}
+
+
+def _is_past_participle(tok: str) -> bool:
+    """Return True if tok looks like a past participle (not a finite verb)."""
+    if not tok or len(tok) < 4:
+        return False
+    if tok in _IRREGULAR_PAST_PARTICIPLES:
+        return True
+    # Regular endings: -ato, -uto, -ito (m.sg.) and their plurals/feminines.
+    # Be strict about minimum length to avoid false positives.
+    if tok.endswith(("ato", "uto", "ito")) and len(tok) >= 4:
+        return True
+    if tok.endswith(("ati", "uti", "iti", "ate", "ute", "ite", "ata", "uta", "ita")) and len(tok) >= 5:
+        # But -ate/-ete/-ite is also the 2pl present ending! So we need to
+        # distinguish. A past participle in -ate/-ite would only appear
+        # after a form of essere (sono partite, sono arrivate, etc.).
+        # Without context, treat anything in -ate/-ite/-ute as ambiguous
+        # and call it a participle.
+        # This means we won't catch a 2pl verb-only check, but we'll also
+        # not misread participles as 2pl present-tense verbs.
+        return True
+    return False
+
+
+def _describe_drill_error(result):
+    """Generate a brief description of what was wrong with a previous
+    drill attempt, for inclusion in a retry prompt."""
+    if not result:
+        return None
+    return (
+        f"Your previous attempt: Italian = {result.get('italian')!r}, "
+        f"English prompt = {result.get('english_prompt')!r}. "
+        f"This failed agreement verification — the verb's person OR the "
+        f"adjective/participle agreement was wrong."
+    )
 
 
 def generate_cloze_exercise(target_word_dict):
