@@ -75,6 +75,7 @@ DRILL CONTEXT — THIS IS A CONJUGATION DRILL:
   Target tense:     {drill_context.get('tense', '')}
   Target person:    {drill_context.get('person', '')}
   Expected form:    {drill_context.get('expected_form', '')}
+  ENGLISH PROMPT THE LEARNER WAS GIVEN: {drill_context.get('english_prompt', expected_english)!r}
 
 For conjugation drills, GRAMMAR is the PRIMARY axis. Be STRICT about:
   - Using the exact target tense (don't accept presente when imperfetto
@@ -82,8 +83,26 @@ For conjugation drills, GRAMMAR is the PRIMARY axis. Be STRICT about:
   - Correct PERSON ending (-o, -i, -a, -iamo, -ate, -ano, etc.)
   - For compound tenses: correct AUXILIARY (avere vs essere) and correct
     past-participle agreement
+  - For PLURAL persons (noi, voi, loro), adjectives and participles MUST
+    be plural too (-i or -e), NOT singular (-o or -a).
   - Irregular forms (e.g. fatto not facuto, detto not dicato, andato/a
     with essere)
+
+CRITICAL — GRADE AGAINST THE ENGLISH PROMPT, NOT JUST THE EXPECTED ITALIAN:
+The "expected Italian" sentence above was AI-generated and may itself contain
+errors. The ENGLISH PROMPT the learner was given is the ground truth.
+If the learner's spoken Italian is a CORRECT translation of the English prompt
+(with proper agreement for the target person), give them FULL CREDIT even if
+their answer differs from the "expected Italian" shown.
+
+For example:
+  English prompt: "They are tired."
+  Expected Italian (possibly wrong): "Sono stanco."
+  Learner said:   "Sono stanchi."
+  → Learner is CORRECT. "Sono stanchi" is the right translation; the
+    expected Italian had a gender/number agreement bug.
+  → Give full credit. Mention in feedback that their answer is correct.
+
 If the learner produced the right MEANING but wrong tense/person,
 GRAMMAR should be low (3-5/10). Vocab can still be high since they
 picked the right verb.
