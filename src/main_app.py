@@ -656,6 +656,7 @@ elif current_mode == 'recall':
                         "tense":      ex.get('tense', ''),
                         "person":     ex.get('person', ''),
                         "expected_form": ex.get('expected_form', ''),
+                        "english_prompt": grade_expected_english,
                     }
                 elif exercise_type == 'cloze':
                     grade_expected_italian = ex.get('cloze_blank', '')
