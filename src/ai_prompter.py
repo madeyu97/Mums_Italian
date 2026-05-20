@@ -198,6 +198,46 @@ CONJUGATION_HINT_KEYWORDS = (
 )
 
 
+def _classify_llm_error(exc):
+    """
+    Classify an exception from an LLM call into a category we can
+    react to differently:
+      - 'rate_limit'   : HTTP 429 or similar, should back off briefly
+      - 'transient'    : network blip, timeout, 5xx — retry
+      - 'json_parse'   : malformed JSON in response — retry
+      - 'auth'         : 401/403 — don't retry, surface it
+      - 'unknown'      : anything else
+    Returns (category, short_description).
+    """
+    import json as _json
+    s = str(exc)
+    low = s.lower()
+    if isinstance(exc, _json.JSONDecodeError):
+        return ("json_parse", f"Malformed JSON: {s[:120]}")
+    if "429" in s or "rate limit" in low or "too many requests" in low:
+        return ("rate_limit", f"Rate limit hit: {s[:120]}")
+    if "401" in s or "403" in s or "unauthorized" in low or "invalid api key" in low:
+        return ("auth", f"Auth error (key invalid?): {s[:120]}")
+    if "500" in s or "502" in s or "503" in s or "504" in s:
+        return ("transient", f"Server 5xx: {s[:120]}")
+    if "timeout" in low or "timed out" in low:
+        return ("transient", f"Timeout: {s[:120]}")
+    if "connection" in low or "network" in low:
+        return ("transient", f"Network: {s[:120]}")
+    return ("unknown", f"Unknown error ({type(exc).__name__}): {s[:200]}")
+
+
+def _wait_before_retry(category, attempt):
+    """Back off briefly between retries. Longer for rate limits."""
+    import time as _time
+    if category == "rate_limit":
+        _time.sleep(2 + attempt * 2)  # 2s, 4s, 6s
+    elif category == "transient":
+        _time.sleep(0.5 + attempt * 0.5)  # 0.5s, 1s, 1.5s
+    else:
+        _time.sleep(0.2)
+
+
 def _classify_target(italian_text: str, english: str, hint: str = "") -> str:
     """
     Best-effort categorisation of the target word/phrase so the AI can build
@@ -1217,16 +1257,45 @@ def generate_dictation_exercise(target_word_dict):
     }}
     """
 
-    try:
-        response = client.chat.completions.create(
-            messages=[{'role': 'user', 'content': prompt}],
-            model=GENERATION_MODEL,
-            response_format={"type": "json_object"}
+    # Call the LLM with up to 3 attempts. Transient errors (rate limits,
+    # timeouts, 5xx, malformed JSON) trigger backoff + retry. Auth and other
+    # errors fail fast.
+    raw_data = None
+    last_error_category = None
+    last_error_desc = None
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                messages=[{'role': 'user', 'content': prompt}],
+                model=GENERATION_MODEL,
+                response_format={"type": "json_object"}
+            )
+            raw_json_str = response.choices[0].message.content
+            if not raw_json_str or not raw_json_str.strip():
+                raise ValueError("Empty response body from LLM")
+            raw_data = json.loads(raw_json_str)
+            break  # success
+        except Exception as e:
+            category, desc = _classify_llm_error(e)
+            last_error_category, last_error_desc = category, desc
+            logging.warning(
+                f"Dictation generation attempt {attempt + 1}/3 failed [{category}]: {desc}"
+            )
+            if category == "auth":
+                # No point retrying auth errors
+                logging.error("Auth failure — not retrying. Check GROQ_API_KEY in Streamlit secrets.")
+                break
+            if attempt < 2:
+                _wait_before_retry(category, attempt)
+
+    if raw_data is None:
+        logging.error(
+            f"Dictation generation FAILED after 3 attempts. "
+            f"Last error [{last_error_category}]: {last_error_desc}"
         )
+        return None
 
-        raw_json_str = response.choices[0].message.content
-        raw_data = json.loads(raw_json_str)
-
+    try:
         # --- SURGICAL LOCK for multi-word entries ---
         if is_locked_phrase:
             final_italian = italian_text
@@ -1332,7 +1401,15 @@ def generate_dictation_exercise(target_word_dict):
         return exercise_data
 
     except Exception as e:
-        logging.error(f"Generation Error via Groq: {e}")
+        # We already succeeded at the LLM call; this is a post-processing
+        # bug (likely in the verifier / breakdown normalisation / etc).
+        # Log with the full type so we can see what to fix.
+        logging.error(
+            f"Post-processing error in generate_dictation_exercise: "
+            f"{type(e).__name__}: {e}"
+        )
+        import traceback
+        logging.error("Traceback:\n" + traceback.format_exc())
         return None
 
 
@@ -1648,14 +1725,46 @@ def _generate_conjugation_drill_once(infinitive, english, tense, person, attempt
     }}
     """
 
-    try:
-        response = client.chat.completions.create(
-            messages=[{'role': 'user', 'content': prompt}],
-            model=GENERATION_MODEL,
-            response_format={"type": "json_object"}
-        )
-        raw_data = json.loads(response.choices[0].message.content)
+    # Up to 3 sub-attempts for THIS call (separate from the outer retry
+    # loop that retries on verifier failures). These sub-attempts handle
+    # transient API errors (rate limits, timeouts, malformed JSON).
+    raw_data = None
+    last_error_category = None
+    last_error_desc = None
+    for sub_attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                messages=[{'role': 'user', 'content': prompt}],
+                model=GENERATION_MODEL,
+                response_format={"type": "json_object"}
+            )
+            raw_json_str = response.choices[0].message.content
+            if not raw_json_str or not raw_json_str.strip():
+                raise ValueError("Empty response body from LLM")
+            raw_data = json.loads(raw_json_str)
+            break
+        except Exception as e:
+            category, desc = _classify_llm_error(e)
+            last_error_category, last_error_desc = category, desc
+            logging.warning(
+                f"Conjugation drill API attempt {sub_attempt + 1}/3 failed "
+                f"[{category}]: {desc}"
+            )
+            if category == "auth":
+                logging.error("Auth failure — not retrying. Check GROQ_API_KEY.")
+                break
+            if sub_attempt < 2:
+                _wait_before_retry(category, sub_attempt)
 
+    if raw_data is None:
+        logging.error(
+            f"Conjugation drill API call FAILED after 3 sub-attempts "
+            f"(outer attempt {attempt + 1}). Last error [{last_error_category}]: "
+            f"{last_error_desc}"
+        )
+        return None
+
+    try:
         # Normalise word breakdown (same shape as free-recall exercises)
         word_breakdown = []
         for item in raw_data.get("word_breakdown", []):
@@ -1685,7 +1794,12 @@ def _generate_conjugation_drill_once(infinitive, english, tense, person, attempt
             "target_category":  "verb_form",
         }
     except Exception as e:
-        logging.error(f"Conjugation drill generation failed (attempt {attempt + 1}): {e}")
+        logging.error(
+            f"Conjugation drill post-processing error (attempt {attempt + 1}): "
+            f"{type(e).__name__}: {e}"
+        )
+        import traceback
+        logging.error("Traceback:\n" + traceback.format_exc())
         return None
 
 
