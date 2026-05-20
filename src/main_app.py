@@ -379,7 +379,26 @@ if st.session_state.current_exercise is None:
                 st.session_state.shuffled_options = []
             save_cached_session()
         else:
-            st.error("Failed to generate exercise. Check your API connection.")
+            st.error(
+                "⚠️ Couldn't generate this card right now. "
+                "This is usually a temporary glitch (rate limit, network blip, or a malformed AI response)."
+            )
+            st.caption(
+                "Check the app logs (Manage app → Logs) for details if it keeps happening."
+            )
+            retry_col, skip_col = st.columns(2)
+            with retry_col:
+                if st.button("🔄 Try this card again", type="primary", width="stretch"):
+                    reset_card_state()
+                    save_cached_session()
+                    st.rerun()
+            with skip_col:
+                if st.button("⏭️ Skip this card", width="stretch"):
+                    # Advance past the broken card without grading it
+                    st.session_state.current_index += 1
+                    reset_card_state()
+                    save_cached_session()
+                    st.rerun()
             st.stop()
 
 # ==========================================
