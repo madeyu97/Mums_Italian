@@ -214,6 +214,10 @@ def _classify_llm_error(exc):
     low = s.lower()
     if isinstance(exc, _json.JSONDecodeError):
         return ("json_parse", f"Malformed JSON: {s[:120]}")
+    # Groq sometimes returns HTTP 400 with json_validate_failed — treat
+    # like a JSON parse error and retry.
+    if "json_validate_failed" in low or "failed to generate json" in low:
+        return ("json_parse", f"LLM failed to produce valid JSON: {s[:120]}")
     if "429" in s or "rate limit" in low or "too many requests" in low:
         return ("rate_limit", f"Rate limit hit: {s[:120]}")
     if "401" in s or "403" in s or "unauthorized" in low or "invalid api key" in low:
@@ -228,14 +232,42 @@ def _classify_llm_error(exc):
 
 
 def _wait_before_retry(category, attempt):
-    """Back off briefly between retries. Longer for rate limits."""
+    """
+    Back off briefly between retries. Longer for rate limits, because
+    Groq's free tier limit resets per minute — short backoffs just burn
+    through the remaining quota.
+    """
     import time as _time
     if category == "rate_limit":
-        _time.sleep(2 + attempt * 2)  # 2s, 4s, 6s
+        # Free-tier window is per-minute. Wait long enough that retries
+        # actually have a chance of succeeding. 15s, 30s, 45s.
+        _time.sleep(15 + attempt * 15)
     elif category == "transient":
         _time.sleep(0.5 + attempt * 0.5)  # 0.5s, 1s, 1.5s
     else:
         _time.sleep(0.2)
+
+
+def _unwrap_json_response(raw_data):
+    """
+    Groq's JSON mode usually returns a dict, but occasionally the model
+    wraps the response in a list like [{"italian": ...}] instead of just
+    {"italian": ...}. Unwrap single-element lists; otherwise return the
+    first item with expected keys, or the first dict.
+    """
+    if isinstance(raw_data, list):
+        if not raw_data:
+            return {}
+        if len(raw_data) == 1 and isinstance(raw_data[0], dict):
+            return raw_data[0]
+        # Multiple items — pick the first with the expected keys
+        for item in raw_data:
+            if isinstance(item, dict) and ("italian" in item or "hanzi" in item or "english_prompt" in item):
+                return item
+        if isinstance(raw_data[0], dict):
+            return raw_data[0]
+        return {}
+    return raw_data if isinstance(raw_data, dict) else {}
 
 
 def _classify_target(italian_text: str, english: str, hint: str = "") -> str:
@@ -1273,7 +1305,7 @@ def generate_dictation_exercise(target_word_dict):
             raw_json_str = response.choices[0].message.content
             if not raw_json_str or not raw_json_str.strip():
                 raise ValueError("Empty response body from LLM")
-            raw_data = json.loads(raw_json_str)
+            raw_data = _unwrap_json_response(json.loads(raw_json_str))
             break  # success
         except Exception as e:
             category, desc = _classify_llm_error(e)
@@ -1741,7 +1773,7 @@ def _generate_conjugation_drill_once(infinitive, english, tense, person, attempt
             raw_json_str = response.choices[0].message.content
             if not raw_json_str or not raw_json_str.strip():
                 raise ValueError("Empty response body from LLM")
-            raw_data = json.loads(raw_json_str)
+            raw_data = _unwrap_json_response(json.loads(raw_json_str))
             break
         except Exception as e:
             category, desc = _classify_llm_error(e)
