@@ -94,3 +94,13 @@ MASTERED_INTERVAL_DAYS = 365
 # Target vocabulary size for the fluency progress indicator.
 # Conventional rough threshold for functional fluency in a language.
 FLUENCY_TARGET = 10000
+
+# ==========================================
+# 10. BREATH PAUSE (spaced consolidation)
+# ==========================================
+# Every N cards, the app shows a brief guided box-breathing pause.
+# Helps with retention (short rests between learning episodes aid
+# consolidation) AND keeps Groq's per-minute rate limit happy.
+# Set BREATH_PAUSE_EVERY = 0 to disable.
+BREATH_PAUSE_EVERY    = 8     # Show a breath every 8 graded cards
+BREATH_PAUSE_SECONDS  = 30    # Duration of each pause
