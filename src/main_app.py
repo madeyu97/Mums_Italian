@@ -21,7 +21,10 @@ from db_manager import (
     mark_word_mastered,
 )
 from speech_engine import transcribe_audio, grade_speech, GRADE_MAP
-from config import LISTENING_PCT, MAX_REVIEWS_PER_DAY, MASTERED_INTERVAL_DAYS, FLUENCY_TARGET
+from config import (
+    LISTENING_PCT, MAX_REVIEWS_PER_DAY, MASTERED_INTERVAL_DAYS,
+    FLUENCY_TARGET, BREATH_PAUSE_EVERY, BREATH_PAUSE_SECONDS,
+)
 
 # ==========================================
 # 1. CACHE MANAGEMENT
@@ -55,6 +58,8 @@ def save_cached_session():
         "audio_history": st.session_state.audio_history,
         "recall_result": st.session_state.recall_result,
         "recall_history": st.session_state.recall_history,
+        "cards_since_break": st.session_state.get("cards_since_break", 0),
+        "breath_pause_active": st.session_state.get("breath_pause_active", False),
     }
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache, f)
@@ -103,6 +108,10 @@ if 'words_due' not in st.session_state:
             st.session_state.recall_history = {}
         if 'user_typed' not in st.session_state:
             st.session_state.user_typed = ""
+        if 'cards_since_break' not in st.session_state:
+            st.session_state.cards_since_break = 0
+        if 'breath_pause_active' not in st.session_state:
+            st.session_state.breath_pause_active = False
         st.session_state.session_date = str(date.today())
     else:
         # No cache — show the setup screen
@@ -146,6 +155,8 @@ if 'words_due' not in st.session_state:
             st.session_state.audio_history = {}
             st.session_state.recall_result = None
             st.session_state.recall_history = {}
+            st.session_state.cards_since_break = 0
+            st.session_state.breath_pause_active = False
             st.session_state.session_date = str(date.today())
             save_cached_session()
         st.rerun()
@@ -162,6 +173,20 @@ def reset_card_state():
     st.session_state.mcq_correct = None
     st.session_state.recall_result = None
 
+def _maybe_trigger_breath_pause():
+    """
+    After a card is graded, check whether we've hit the breath-pause
+    threshold. If so, activate the pause UI for the next render.
+    Skipped if there are no more cards (don't pause at session end).
+    """
+    if BREATH_PAUSE_EVERY <= 0:
+        return
+    st.session_state.cards_since_break = st.session_state.get("cards_since_break", 0) + 1
+    if (st.session_state.cards_since_break >= BREATH_PAUSE_EVERY and
+            st.session_state.current_index < len(st.session_state.words_due)):
+        st.session_state.breath_pause_active = True
+        st.session_state.cards_since_break = 0
+
 def grade_word_and_next(grade):
     current_word = st.session_state.words_due[st.session_state.current_index]
     process_review(
@@ -172,6 +197,7 @@ def grade_word_and_next(grade):
     )
     st.session_state.current_index += 1
     reset_card_state()
+    _maybe_trigger_breath_pause()
     save_cached_session()
 
 def mark_mastered_and_next():
@@ -183,6 +209,7 @@ def mark_mastered_and_next():
     mark_word_mastered(current_word['id'], MASTERED_INTERVAL_DAYS)
     st.session_state.current_index += 1
     reset_card_state()
+    _maybe_trigger_breath_pause()
     save_cached_session()
 
 def undo_last_grade():
@@ -245,6 +272,152 @@ if st.session_state.current_index >= len(st.session_state.words_due):
         if st.button("🔄 Start New Session", type="primary", width="stretch"):
             start_new_session()
             st.rerun()
+    st.stop()
+
+# ==========================================
+# 5.25 BREATH PAUSE — consolidation rest between batches
+# ==========================================
+def render_breath_pause():
+    """
+    Box-breathing pause UI. Animated client-side via HTML/CSS/JS so the
+    countdown ticks smoothly without blocking the server.
+
+    Cycle: inhale 4s → hold 4s → exhale 4s → hold 4s (16s box breath).
+    Default duration is BREATH_PAUSE_SECONDS, which fits roughly two
+    full cycles at 30s.
+    """
+    seconds = BREATH_PAUSE_SECONDS
+    progress_done = st.session_state.current_index
+    progress_total = len(st.session_state.words_due)
+
+    st.markdown("### 🌬️ Breath pause")
+    st.caption(
+        "A short box-breathing rest to let what you've practised settle. "
+        "Brief rests between batches measurably improve memory consolidation — "
+        "this is part of the practice, not an interruption."
+    )
+
+    # Inline HTML + CSS for the breathing animation and countdown.
+    html_block = f"""
+<style>
+.breath-wrap {{
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 8px 32px 8px;
+    color: #d9d9e3;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
+.breath-circle {{
+    width: 220px;
+    height: 220px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%,
+                #6ea8ff 0%, #3a6fd1 55%, #14306b 100%);
+    box-shadow: 0 0 40px rgba(110, 168, 255, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 24px;
+    font-weight: 500;
+    letter-spacing: 0.5px;
+    animation: breath-cycle 16s ease-in-out infinite;
+    transition: transform 0.5s ease;
+}}
+@keyframes breath-cycle {{
+    /* 0-4s: inhale (expand). 4-8s: hold. 8-12s: exhale (shrink). 12-16s: hold. */
+    0%   {{ transform: scale(0.65); }}
+    25%  {{ transform: scale(1.0); }}
+    50%  {{ transform: scale(1.0); }}
+    75%  {{ transform: scale(0.65); }}
+    100% {{ transform: scale(0.65); }}
+}}
+.breath-phase {{
+    margin-top: 18px;
+    font-size: 18px;
+    color: #b3b3c0;
+    min-height: 26px;
+    text-align: center;
+}}
+.breath-countdown {{
+    margin-top: 6px;
+    font-size: 38px;
+    font-weight: 300;
+    color: #f0f0f5;
+    font-variant-numeric: tabular-nums;
+}}
+.breath-progress-row {{
+    margin-top: 14px;
+    font-size: 13px;
+    color: #8a8a99;
+    letter-spacing: 0.3px;
+}}
+</style>
+
+<div class="breath-wrap">
+  <div class="breath-circle" id="breath-circle">
+    <span id="breath-phase-text">Breathe</span>
+  </div>
+  <div class="breath-phase" id="breath-phase">Inhale slowly through your nose…</div>
+  <div class="breath-countdown" id="breath-countdown">{seconds}</div>
+  <div class="breath-progress-row">
+    {progress_done} of {progress_total} cards complete · {seconds}-second rest
+  </div>
+</div>
+
+<script>
+(function() {{
+    const total = {seconds};
+    const phaseTexts = [
+        "Inhale slowly through your nose…",
+        "Hold gently…",
+        "Exhale through your mouth…",
+        "Hold and rest…",
+    ];
+    const circleLabel = ["Inhale", "Hold", "Exhale", "Hold"];
+    let elapsed = 0;
+    const countdownEl = document.getElementById("breath-countdown");
+    const phaseEl = document.getElementById("breath-phase");
+    const labelEl = document.getElementById("breath-phase-text");
+    function tick() {{
+        const remaining = Math.max(0, total - elapsed);
+        if (countdownEl) countdownEl.textContent = remaining;
+        const cycle_t = elapsed % 16;
+        const phase_idx = Math.floor(cycle_t / 4);
+        if (phaseEl) phaseEl.textContent = phaseTexts[phase_idx];
+        if (labelEl) labelEl.textContent = circleLabel[phase_idx];
+        elapsed += 1;
+    }}
+    tick();
+    const iv = setInterval(tick, 1000);
+    setTimeout(function() {{ clearInterval(iv); }}, (total + 1) * 1000);
+}})();
+</script>
+"""
+    st.html(html_block)
+
+    # Server-side controls beneath the animation
+    skip_col, _dummy, done_col = st.columns([1, 1, 1])
+    with skip_col:
+        if st.button("⏭️ Skip pause", width="stretch", key="breath_skip"):
+            st.session_state.breath_pause_active = False
+            save_cached_session()
+            st.rerun()
+    with done_col:
+        if st.button("✓ I'm ready", type="primary", width="stretch", key="breath_done"):
+            st.session_state.breath_pause_active = False
+            save_cached_session()
+            st.rerun()
+
+    st.caption(
+        f"Configurable in `config.py` — currently every "
+        f"{BREATH_PAUSE_EVERY} cards, {BREATH_PAUSE_SECONDS} seconds. "
+        f"Set `BREATH_PAUSE_EVERY = 0` to disable."
+    )
+
+if st.session_state.get("breath_pause_active", False):
+    render_breath_pause()
     st.stop()
 
 current_word = st.session_state.words_due[st.session_state.current_index]
