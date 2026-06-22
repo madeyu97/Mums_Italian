@@ -16,17 +16,14 @@ AUDIO_PATH = DATA_DIR / "current_audio.mp3"
 # All standard Italian. Mixing male/female + neural variants gives real
 # ear-training value (different timbres, speaking rates, expressiveness).
 VOICE_CAST = [
+    # Only voices confirmed reliable on edge-tts. The expressive voices
+    # (Benigno, Fabiola, Fiamma, Palmira, Lisandro, Calimero) have been
+    # frequently returning empty audio responses — kept out of the cast.
     "it-IT-ElsaNeural",        # F, standard
     "it-IT-IsabellaNeural",    # F, standard
     "it-IT-GiuseppeNeural",    # M, standard
     "it-IT-DiegoNeural",       # M, standard
-    "it-IT-BenignoNeural",     # M, expressive
-    "it-IT-FabiolaNeural",     # F
-    "it-IT-FiammaNeural",      # F
-    "it-IT-GianniNeural",      # M
-    "it-IT-CalimeroNeural",    # M
-    "it-IT-PalmiraNeural",     # F
-    "it-IT-LisandroNeural",    # M
+    "it-IT-GianniNeural",      # M, standard
 ]
 
 # Fallback if a chosen voice fails for any reason
