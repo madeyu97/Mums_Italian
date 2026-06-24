@@ -13,6 +13,7 @@ from ai_prompter import (
     generate_conjugation_drill,
     generate_cloze_exercise,
     choose_recall_strategy,
+    get_last_error_category,
 )
 from audio_engine import create_audio_file
 from db_manager import (
@@ -60,6 +61,8 @@ def save_cached_session():
         "recall_history": st.session_state.recall_history,
         "cards_since_break": st.session_state.get("cards_since_break", 0),
         "breath_pause_active": st.session_state.get("breath_pause_active", False),
+        "gen_failed_this_turn": st.session_state.get("gen_failed_this_turn", False),
+        "last_gen_error": st.session_state.get("last_gen_error", None),
     }
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache, f)
@@ -112,6 +115,10 @@ if 'words_due' not in st.session_state:
             st.session_state.cards_since_break = 0
         if 'breath_pause_active' not in st.session_state:
             st.session_state.breath_pause_active = False
+        if 'gen_failed_this_turn' not in st.session_state:
+            st.session_state.gen_failed_this_turn = False
+        if 'last_gen_error' not in st.session_state:
+            st.session_state.last_gen_error = None
         st.session_state.session_date = str(date.today())
     else:
         # No cache — show the setup screen
@@ -157,6 +164,8 @@ if 'words_due' not in st.session_state:
             st.session_state.recall_history = {}
             st.session_state.cards_since_break = 0
             st.session_state.breath_pause_active = False
+            st.session_state.gen_failed_this_turn = False
+            st.session_state.last_gen_error = None
             st.session_state.session_date = str(date.today())
             save_cached_session()
         st.rerun()
@@ -172,6 +181,8 @@ def reset_card_state():
     st.session_state.user_typed = ""
     st.session_state.mcq_correct = None
     st.session_state.recall_result = None
+    st.session_state.gen_failed_this_turn = False
+    st.session_state.last_gen_error = None
 
 def _maybe_trigger_breath_pause():
     """
@@ -507,32 +518,48 @@ with st.sidebar:
 # ==========================================
 # 6. EXERCISE GENERATION (routes by mode + recall sub-mode)
 # ==========================================
+def _attempt_generate_exercise():
+    """
+    Try to generate an exercise for the current card. Returns the
+    exercise dict on success, None on failure.
+
+    Routes to the right generator based on listen vs recall mode and,
+    for recall, on the chosen strategy.
+    """
+    if current_mode == 'listen':
+        ex = generate_dictation_exercise(current_word)
+        if ex is not None:
+            ex.setdefault("exercise_type", "listen")
+        return ex
+
+    # Recall: pick strategy
+    strategy = choose_recall_strategy(current_word)
+    if strategy == 'conjugation':
+        ex = generate_conjugation_drill(current_word)
+        if ex is None:
+            # Don't burn another LLM call on free recall if we got rate-limited
+            if get_last_error_category() == "rate_limit":
+                return None
+            ex = generate_dictation_exercise(current_word)
+            if ex is not None:
+                ex["exercise_type"] = "free"
+        return ex
+    elif strategy == 'cloze':
+        return generate_cloze_exercise(current_word)
+    else:
+        ex = generate_dictation_exercise(current_word)
+        if ex is not None:
+            ex["exercise_type"] = "free"
+        return ex
+
+
 if st.session_state.current_exercise is None:
-    with st.spinner("Generating Italian scenario..."):
-        if current_mode == 'listen':
-            # Listening always uses the standard dictation generator
-            exercise_data = generate_dictation_exercise(current_word)
-            if exercise_data is not None:
-                exercise_data.setdefault("exercise_type", "listen")
-        else:
-            # Recall: route to conjugation drill / cloze / free recall
-            strategy = choose_recall_strategy(current_word)
-            if strategy == 'conjugation':
-                exercise_data = generate_conjugation_drill(current_word)
-                # Fall back to free recall if drill generation fails
-                if exercise_data is None:
-                    logging._silenced = True  # noop; just suppress lint
-                    exercise_data = generate_dictation_exercise(current_word)
-                    if exercise_data is not None:
-                        exercise_data["exercise_type"] = "free"
-            elif strategy == 'cloze':
-                exercise_data = generate_cloze_exercise(current_word)
-                # generate_cloze_exercise already falls back to "free" internally
-                # if the target word isn't found in the generated sentence.
-            else:
-                exercise_data = generate_dictation_exercise(current_word)
-                if exercise_data is not None:
-                    exercise_data["exercise_type"] = "free"
+    # Only run generation if we haven't already failed this turn.
+    # st.session_state.gen_failed_this_turn prevents the silent re-attempt
+    # on every rerun when the user is on the failure screen.
+    if not st.session_state.get("gen_failed_this_turn", False):
+        with st.spinner("Generating Italian scenario..."):
+            exercise_data = _attempt_generate_exercise()
 
         if exercise_data:
             st.session_state.current_exercise = exercise_data
@@ -543,36 +570,72 @@ if st.session_state.current_exercise is None:
             st.session_state.exercise_history[idx_str] = exercise_data
             st.session_state.audio_history[idx_str] = st.session_state.audio_path
 
-            # MCQ options only matter for the listening flow
             if current_mode == 'listen' and exercise_data.get("english_distractors"):
                 options = exercise_data['english_distractors'] + [exercise_data['english_correct']]
                 random.shuffle(options)
                 st.session_state.shuffled_options = options
             else:
                 st.session_state.shuffled_options = []
+            st.session_state.gen_failed_this_turn = False
             save_cached_session()
         else:
+            # Mark so the next rerun won't silently retry generation —
+            # user must click a button.
+            st.session_state.gen_failed_this_turn = True
+            st.session_state.last_gen_error = get_last_error_category() or "unknown"
+            save_cached_session()
+
+    # Failure UI (shown on the same rerun if generation just failed, or
+    # on subsequent reruns if user is sitting on the failure screen).
+    if st.session_state.current_exercise is None:
+        err_cat = st.session_state.get("last_gen_error", "unknown")
+        if err_cat == "rate_limit":
             st.error(
-                "⚠️ Couldn't generate this card right now. "
-                "This is usually a temporary glitch (rate limit, network blip, or a malformed AI response)."
+                "🚦 **You've hit Groq's rate limit.** "
+                "This happens on the free tier after about 30 requests per minute. "
+                "It will reset automatically — please wait around **60 seconds** before continuing."
             )
             st.caption(
-                "Check the app logs (Manage app → Logs) for details if it keeps happening."
+                "Tip: the breath pause every 8 cards helps keep this from happening. "
+                "If you're seeing it often, consider upgrading to Groq's Developer tier "
+                "(about $5/mo of usage, 10× the throughput)."
             )
-            retry_col, skip_col = st.columns(2)
-            with retry_col:
-                if st.button("🔄 Try this card again", type="primary", width="stretch"):
-                    reset_card_state()
-                    save_cached_session()
-                    st.rerun()
-            with skip_col:
-                if st.button("⏭️ Skip this card", width="stretch"):
-                    # Advance past the broken card without grading it
-                    st.session_state.current_index += 1
-                    reset_card_state()
-                    save_cached_session()
-                    st.rerun()
-            st.stop()
+        elif err_cat == "auth":
+            st.error(
+                "🔑 **API key error.** Your Groq API key seems to be missing or invalid. "
+                "Go to Streamlit Cloud → your app → ⋮ → Settings → Secrets, "
+                "and check that GROQ_API_KEY is correct."
+            )
+        elif err_cat == "json_parse":
+            st.error(
+                "🤖 **The AI returned a malformed response.** This usually clears on the next try. "
+                "Click 'Try again' below."
+            )
+        else:
+            st.error(
+                "⚠️ **Couldn't generate this card right now.** "
+                "Usually a transient glitch — try again or skip."
+            )
+            st.caption("Check Manage app → Logs for details if this keeps happening.")
+
+        retry_col, skip_col = st.columns(2)
+        with retry_col:
+            if st.button("🔄 Try again", type="primary", width="stretch", key="retry_gen"):
+                st.session_state.gen_failed_this_turn = False
+                st.session_state.last_gen_error = None
+                save_cached_session()
+                st.rerun()
+        with skip_col:
+            if st.button("⏭️ Skip this card", width="stretch", key="skip_gen"):
+                # Move to the next card; clear the failure flag so the
+                # next card gets a fresh attempt.
+                st.session_state.current_index += 1
+                st.session_state.gen_failed_this_turn = False
+                st.session_state.last_gen_error = None
+                reset_card_state()
+                save_cached_session()
+                st.rerun()
+        st.stop()
 
 # ==========================================
 # Reusable renderers
