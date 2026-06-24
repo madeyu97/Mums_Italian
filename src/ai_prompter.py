@@ -233,19 +233,37 @@ def _classify_llm_error(exc):
 
 def _wait_before_retry(category, attempt):
     """
-    Back off briefly between retries. Longer for rate limits, because
-    Groq's free tier limit resets per minute — short backoffs just burn
-    through the remaining quota.
+    Brief, non-blocking-feeling wait between retries.
+
+    Rate-limit retries used to wait 15-45s, but that locks Streamlit's
+    spinner for an eternity from the user's point of view. We now
+    bail out immediately on rate limits (the caller surfaces a clear
+    "wait 60s" message) and only sleep briefly for genuine transient
+    network errors that will likely clear on the next attempt.
     """
     import time as _time
-    if category == "rate_limit":
-        # Free-tier window is per-minute. Wait long enough that retries
-        # actually have a chance of succeeding. 15s, 30s, 45s.
-        _time.sleep(15 + attempt * 15)
-    elif category == "transient":
-        _time.sleep(0.5 + attempt * 0.5)  # 0.5s, 1s, 1.5s
-    else:
-        _time.sleep(0.2)
+    if category == "transient":
+        _time.sleep(0.3 + attempt * 0.2)  # 0.3s, 0.5s, 0.7s
+    elif category == "json_parse":
+        _time.sleep(0.2)  # quick retry is fine for malformed JSON
+    # No sleep for rate_limit, auth, or unknown — fail fast or quick retry
+
+
+# Module-level: the category of the most recent generation failure
+# (or None for success). Read by main_app.py to show context-specific
+# user messages — e.g. "Wait 60 seconds" for rate limits vs a generic
+# "try again" for other failures.
+_last_error_category = None
+
+
+def _record_last_error(category):
+    global _last_error_category
+    _last_error_category = category
+
+
+def get_last_error_category():
+    """Read the category of the most recent generation failure."""
+    return _last_error_category
 
 
 def _unwrap_json_response(raw_data):
@@ -1314,18 +1332,25 @@ def generate_dictation_exercise(target_word_dict):
                 f"Dictation generation attempt {attempt + 1}/3 failed [{category}]: {desc}"
             )
             if category == "auth":
-                # No point retrying auth errors
                 logging.error("Auth failure — not retrying. Check GROQ_API_KEY in Streamlit secrets.")
+                break
+            if category == "rate_limit":
+                # Don't waste retries — we'd just hit the same limit again.
+                # The caller surfaces a clear "wait 60s" message to the user.
+                logging.warning("Rate-limited — not retrying. Caller should surface 'wait' message.")
                 break
             if attempt < 2:
                 _wait_before_retry(category, attempt)
 
     if raw_data is None:
         logging.error(
-            f"Dictation generation FAILED after 3 attempts. "
-            f"Last error [{last_error_category}]: {last_error_desc}"
+            f"Dictation generation FAILED. Last error [{last_error_category}]: {last_error_desc}"
         )
+        _record_last_error(last_error_category)
         return None
+
+    # Clear the last-error slot on success
+    _record_last_error(None)
 
     try:
         # --- SURGICAL LOCK for multi-word entries ---
@@ -1624,14 +1649,19 @@ def generate_conjugation_drill(target_word_dict, tense=None, person=None):
     if tense is None or person is None:
         tense, person = _pick_conjugation_target()
 
-    # Try up to 3 times — first attempt normal, retries get sharper prompts
+    # Try up to 2 times — first attempt normal, retry gets a sharper prompt
+    # explaining what went wrong. Reduced from 3 to keep quota friendly.
     last_result = None
-    for attempt in range(3):
+    for attempt in range(2):
         result = _generate_conjugation_drill_once(
             infinitive, english, tense, person, attempt=attempt,
             prior_error=(_describe_drill_error(last_result) if last_result else None),
         )
         if result is None:
+            # If the once-call hit a rate limit, don't bother retrying
+            # — we'd just hit the same wall.
+            if get_last_error_category() == "rate_limit":
+                return None
             continue
         last_result = result
         # Verify the generated Italian matches the target person
@@ -1641,15 +1671,15 @@ def generate_conjugation_drill(target_word_dict, tense=None, person=None):
         logging.warning(
             f"Conjugation drill attempt {attempt + 1} failed verification "
             f"(target {tense}, {person}, infinitive={infinitive!r}): {issue}. "
-            f"Italian was: {result.get('italian')!r}. Retrying."
+            f"Italian was: {result.get('italian')!r}."
         )
 
-    # All attempts failed verification — return the last result anyway so
-    # the user gets a card, but it's flagged. Better to show a possibly-wrong
-    # card than to crash, and the user can override with the grade buttons.
+    # Verifier failed but we got SOME result — return it anyway so the user
+    # gets a card. The grader has a "trust the English prompt" instruction
+    # to handle the case where the expected Italian is buggy.
     if last_result is not None:
         logging.warning(
-            f"Conjugation drill returning unverified result after 3 attempts. "
+            f"Conjugation drill returning unverified result after 2 attempts. "
             f"Italian: {last_result.get('italian')!r}"
         )
     return last_result
@@ -1785,15 +1815,18 @@ def _generate_conjugation_drill_once(infinitive, english, tense, person, attempt
             if category == "auth":
                 logging.error("Auth failure — not retrying. Check GROQ_API_KEY.")
                 break
+            if category == "rate_limit":
+                logging.warning("Rate-limited — not retrying.")
+                break
             if sub_attempt < 2:
                 _wait_before_retry(category, sub_attempt)
 
     if raw_data is None:
         logging.error(
-            f"Conjugation drill API call FAILED after 3 sub-attempts "
-            f"(outer attempt {attempt + 1}). Last error [{last_error_category}]: "
-            f"{last_error_desc}"
+            f"Conjugation drill API call FAILED (outer attempt {attempt + 1}). "
+            f"Last error [{last_error_category}]: {last_error_desc}"
         )
+        _record_last_error(last_error_category)
         return None
 
     try:
@@ -1809,6 +1842,8 @@ def _generate_conjugation_drill_once(infinitive, english, tense, person, attempt
                 wb["stress"] = item["stress"]
             word_breakdown.append(wb)
 
+        # Clear last-error slot on success
+        _record_last_error(None)
         return {
             "exercise_type":    "conjugation",
             "infinitive":       infinitive,
