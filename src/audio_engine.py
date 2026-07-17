@@ -17,13 +17,12 @@ AUDIO_PATH = DATA_DIR / "current_audio.mp3"
 # ear-training value (different timbres, speaking rates, expressiveness).
 VOICE_CAST = [
     # Only voices confirmed reliable on edge-tts. The expressive voices
-    # (Benigno, Fabiola, Fiamma, Palmira, Lisandro, Calimero) have been
-    # frequently returning empty audio responses — kept out of the cast.
+    # (Benigno, Fabiola, Fiamma, Palmira, Lisandro, Calimero) and Gianni
+    # have been returning empty audio responses — kept out of the cast.
     "it-IT-ElsaNeural",        # F, standard
     "it-IT-IsabellaNeural",    # F, standard
     "it-IT-GiuseppeNeural",    # M, standard
     "it-IT-DiegoNeural",       # M, standard
-    "it-IT-GianniNeural",      # M, standard
 ]
 
 # Fallback if a chosen voice fails for any reason
@@ -32,6 +31,19 @@ FALLBACK_VOICE = "it-IT-ElsaNeural"
 async def _generate_audio_async(text: str, voice: str, output_path: str, rate: str = "+0%"):
     communicate = edge_tts.Communicate(text, voice, rate=rate)
     await communicate.save(output_path)
+
+# Hard cap per TTS attempt. Without this, a hung Edge TTS request froze
+# the whole card until edge-tts's own (long) internal timeout expired —
+# twice, if the fallback also hung.
+TTS_TIMEOUT_SECONDS = 12
+
+def _run_tts_with_timeout(text: str, voice: str, output_path: str, rate: str):
+    asyncio.run(
+        asyncio.wait_for(
+            _generate_audio_async(text, voice, output_path, rate=rate),
+            timeout=TTS_TIMEOUT_SECONDS,
+        )
+    )
 
 def create_audio_file(italian_text: str, voice: str = None, slow: bool = False):
     """
@@ -66,12 +78,12 @@ def create_audio_file(italian_text: str, voice: str = None, slow: bool = False):
 
     # 3. Generate Audio
     try:
-        asyncio.run(_generate_audio_async(clean_text, selected_voice, str(AUDIO_PATH), rate=rate))
+        _run_tts_with_timeout(clean_text, selected_voice, str(AUDIO_PATH), rate)
         return str(AUDIO_PATH)
     except Exception as e:
         logging.warning(f"Voice {selected_voice} failed ({e}). Trying fallback...")
         try:
-            asyncio.run(_generate_audio_async(clean_text, FALLBACK_VOICE, str(AUDIO_PATH), rate=rate))
+            _run_tts_with_timeout(clean_text, FALLBACK_VOICE, str(AUDIO_PATH), rate)
             return str(AUDIO_PATH)
         except Exception as e_final:
             logging.error(f"Total Audio Failure: {e_final}")
