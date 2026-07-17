@@ -26,7 +26,9 @@ def get_connection():
         db_url = os.environ["DATABASE_URL"]
     if not db_url:
         raise ValueError("CRITICAL ERROR: DATABASE_URL is missing! Streamlit cannot find it in the Secrets menu.")
-    return psycopg2.connect(db_url)
+    # connect_timeout stops the app hanging for minutes when Supabase is
+    # paused (free tier pauses after ~1 week idle) or unreachable.
+    return psycopg2.connect(db_url, connect_timeout=10)
 
 def init_db():
     conn = get_connection()
@@ -69,13 +71,42 @@ def import_vocab_from_csv():
     Expects italian_vocab.csv with columns:
         Italian, English, Hint (optional)
 
-    Performs a single batched INSERT with ON CONFLICT DO NOTHING so
-    duplicates are skipped at the database level. Handles 10k+ rows
-    in seconds instead of minutes.
+    FAST PATH: before doing any real work, compare the DB row count to
+    the CSV line count. If the DB already has at least as many rows,
+    skip the import entirely — no pandas read, no 10k-row INSERT shipped
+    to Supabase. This turns every warm boot from seconds of dead time
+    into a single COUNT query.
+
+    Performs a single batched INSERT with ON CONFLICT DO NOTHING when an
+    import IS needed, so duplicates are skipped at the database level.
     """
     if not VOCAB_CSV_PATH.exists():
         logging.warning("CSV file not found. Skipping import.")
         return
+
+    # --- Fast path: cheap line count vs DB count ---
+    try:
+        with open(VOCAB_CSV_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            csv_line_count = sum(1 for _ in f) - 1  # minus header
+    except Exception:
+        csv_line_count = None
+
+    if csv_line_count is not None and csv_line_count > 0:
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM vocab_progress")
+            db_count = cursor.fetchone()[0]
+            conn.close()
+            if db_count >= csv_line_count:
+                logging.info(
+                    f"CSV import skipped: DB has {db_count} rows, "
+                    f"CSV has {csv_line_count} lines. Nothing new."
+                )
+                return
+        except Exception as e:
+            # Table might not exist yet on first boot — fall through to import
+            logging.info(f"Fast-path count check failed ({e}); running full import.")
 
     df = pd.read_csv(VOCAB_CSV_PATH)
 
@@ -237,19 +268,21 @@ def update_word_progress(word_id, next_review_date, new_interval, new_ease):
     conn.close()
 
 def get_progress_stats():
+    """Single-query stats (was 4 separate COUNTs = 4 round trips)."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM vocab_progress")
-    total_words = cursor.fetchone()[0]
-    if total_words == 0:
-        conn.close()
-        return {"unseen": 0, "learning": 0, "mastered": 0, "total": 0}
-    cursor.execute("SELECT COUNT(*) FROM vocab_progress WHERE review_count = 0")
-    unseen = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM vocab_progress WHERE interval >= 21")
-    mastered = cursor.fetchone()[0]
-    learning = total_words - unseen - mastered
+    cursor.execute("""
+        SELECT
+            COUNT(*)                                        AS total,
+            COUNT(*) FILTER (WHERE review_count = 0)        AS unseen,
+            COUNT(*) FILTER (WHERE interval >= 21)          AS mastered
+        FROM vocab_progress
+    """)
+    total_words, unseen, mastered = cursor.fetchone()
     conn.close()
+    if total_words == 0:
+        return {"unseen": 0, "learning": 0, "mastered": 0, "total": 0}
+    learning = total_words - unseen - mastered
     return {"unseen": unseen, "learning": learning, "mastered": mastered, "total": total_words}
 
 def undo_word_progress(word_id, old_next_review_date, old_interval, old_ease, old_review_count, old_priority):
@@ -313,6 +346,32 @@ def update_word_in_db(word_id, new_italian, new_english, new_hint=''):
     ''', (new_italian, new_english, new_hint, word_id))
     conn.commit()
     conn.close()
+
+def save_flagged_card(exercise_json, user_note=""):
+    """
+    Store a card the learner reported as wrong. Reviewable later in
+    Supabase (Table Editor → flagged_cards) to spot error patterns and
+    tune prompts. Creates the table lazily on first use.
+    """
+    import json as _json
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS flagged_cards (
+            id SERIAL PRIMARY KEY,
+            flagged_at TEXT NOT NULL,
+            user_note TEXT DEFAULT '',
+            exercise JSONB
+        )
+    ''')
+    cursor.execute('''
+        INSERT INTO flagged_cards (flagged_at, user_note, exercise)
+        VALUES (%s, %s, %s)
+    ''', (datetime.now().isoformat(), user_note,
+          _json.dumps(exercise_json, ensure_ascii=False, default=str)))
+    conn.commit()
+    conn.close()
+
 
 def mark_word_mastered(word_id, interval_days):
     """
