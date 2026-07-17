@@ -73,8 +73,12 @@ CLOZE_DRILL_PROB       = 0.70
 # ==========================================
 # 7. AI MODELS
 # ==========================================
-GENERATION_MODEL = "llama-3.3-70b-versatile"
-GRADING_MODEL = "llama-3.3-70b-versatile"
+# NOTE: llama-3.3-70b-versatile was DEPRECATED by Groq on 17 June 2026.
+# qwen/qwen3.6-27b is currently the strongest model on Groq (and notably
+# good multilingually — important for Italian grammar quality).
+# Alternative if qwen has issues: "openai/gpt-oss-120b".
+GENERATION_MODEL = "qwen/qwen3.6-27b"
+GRADING_MODEL = "qwen/qwen3.6-27b"
 WHISPER_MODEL = "whisper-large-v3"
 
 # ==========================================
