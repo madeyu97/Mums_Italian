@@ -14,7 +14,12 @@ from dotenv import load_dotenv
 from config import WHISPER_MODEL, GRADING_MODEL, LANGUAGE_CODE
 
 load_dotenv()
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# timeout: hard cap so a hung request cannot freeze the app for minutes.
+# max_retries=0: the SDK silently retries 429s/5xx twice with exponential
+# backoff by DEFAULT. Stacked under our own retry loops, a rate-limited
+# card could fire many hidden HTTP requests and hang for a minute+.
+# We handle retries ourselves (fast-failing) — the SDK must not.
+client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=25.0, max_retries=0)
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
