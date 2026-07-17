@@ -19,7 +19,7 @@ from audio_engine import create_audio_file
 from db_manager import (
     flag_word_in_database, get_progress_stats, undo_word_progress,
     get_more_words, delete_word_from_db, update_word_in_db,
-    mark_word_mastered,
+    mark_word_mastered, save_flagged_card,
 )
 from speech_engine import transcribe_audio, grade_speech, GRADE_MAP
 from config import (
@@ -80,6 +80,15 @@ def clear_cached_session():
 # ==========================================
 st.set_page_config(page_title="Italian Immersion", page_icon="🇮🇹", layout="centered")
 
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_progress_stats():
+    """
+    Sidebar stats, cached for 60s. Without this, EVERY button click
+    opened a fresh Supabase connection and ran COUNT queries — a big
+    contributor to per-interaction lag.
+    """
+    return get_progress_stats()
+
 def assign_modes(words):
     """Assign each card 'listen' or 'recall', then shuffle."""
     n = len(words)
@@ -123,7 +132,7 @@ if 'words_due' not in st.session_state:
     else:
         # No cache — show the setup screen
         st.title("🇮🇹 Italian Immersion Study")
-        stats = get_progress_stats()
+        stats = cached_progress_stats()
         st.markdown(f"You have **{stats['total']}** words in your vocabulary database.")
         st.markdown("### How long should today's session be?")
 
@@ -456,7 +465,7 @@ st.markdown("---")
 # ==========================================
 with st.sidebar:
     st.header("📊 Global Progress")
-    stats = get_progress_stats()
+    stats = cached_progress_stats()
 
     # ---- Fluency-to-10k indicator ----
     mastered_count = stats.get('mastered', 0)
@@ -689,6 +698,27 @@ def render_breakdown():
                         st.markdown(f"📚 [WordReference]({wordref_url})")
                         st.markdown(f"💬 [Reverso Context]({reverso_url})")
                         st.markdown(f"🇮🇹 [Treccani]({treccani_url})")
+
+    # ---- Report a mistake (one-tap error flagging) ----
+    with st.expander("🚩 Something wrong with this card?"):
+        st.caption(
+            "If the Italian, the translation, or a grammar note looks wrong, "
+            "report it here. Reports are saved for review so recurring "
+            "mistakes can be fixed at the source. "
+            "(Heads-up: after 'penso che', forms like 'parli' really are "
+            "3rd person — that's the congiuntivo, not a bug!)"
+        )
+        report_note = st.text_input(
+            "What's wrong? (optional)",
+            key=f"report_note_{st.session_state.current_index}",
+            placeholder="e.g. wrong tense label on 'parli'",
+        )
+        if st.button("🚩 Report this card", key=f"report_btn_{st.session_state.current_index}"):
+            try:
+                save_flagged_card(ex, user_note=report_note or "")
+                st.toast("Reported — thank you! Saved for review.")
+            except Exception as e:
+                st.warning(f"Couldn't save the report right now ({e}).")
 
 def render_card_settings():
     st.markdown("---")
