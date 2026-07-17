@@ -9,7 +9,12 @@ from dotenv import load_dotenv
 from config import GENERATION_MODEL
 
 load_dotenv()
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# timeout: hard cap so a hung request cannot freeze the app for minutes.
+# max_retries=0: the SDK silently retries 429s/5xx twice with exponential
+# backoff by DEFAULT. Stacked under our own retry loops, a rate-limited
+# card could fire many hidden HTTP requests and hang for a minute+.
+# We handle retries ourselves (fast-failing) — the SDK must not.
+client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=25.0, max_retries=0)
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
@@ -1280,6 +1285,19 @@ def generate_dictation_exercise(target_word_dict):
       - its English meaning IN THIS CONTEXT
       - a short note: gender (m./f.), number (sing./pl.), or verb info
         (e.g. "1st pers. sing. passato prossimo") if useful.
+      - CONGIUNTIVO DISAMBIGUATION (MANDATORY): if a verb is in the
+        congiuntivo, the note MUST both name the person AND preempt the
+        indicativo confusion, because -are congiuntivo forms in -i look
+        like 2nd person indicativo. Example note for 'parli' in
+        "penso che lei parli":
+          "3rd pers. sing. congiuntivo presente of parlare — NOT the
+           indicativo 'tu parli'; after 'penso che', io/tu/lui/lei all
+           take -i"
+        Never label a congiuntivo form with only "3rd person singular"
+        and no explanation — learners will read it as an error.
+      - VERB NOTES MUST BE SELF-CHECKED: before returning, re-verify
+        every person/tense label against the actual subject in the
+        sentence. A wrong label is worse than no label.
       - OPTIONAL 'stress' field for words with NON-DEFAULT (non-penultimate) stress.
         Default stress in Italian is penultimate, so OMIT this field for normal words.
         Include ONLY for sdrucciole (antepenultimate stress) and bisdrucciole.
