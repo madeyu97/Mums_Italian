@@ -271,6 +271,65 @@ def get_last_error_category():
     return _last_error_category
 
 
+def _extract_json_from_text(text: str):
+    """
+    Robustly extract a JSON object from model output that may include
+    code fences, prose, or thinking preamble. Used as the fallback when
+    Groq's server-side json_object validation rejects a response.
+    """
+    if not text:
+        raise ValueError("Empty text")
+    t = text.strip()
+    # Strip markdown code fences
+    if "```" in t:
+        parts = t.split("```")
+        # take the largest fenced block, dropping a leading 'json' tag
+        candidates = []
+        for p in parts:
+            p = p.strip()
+            if p.lower().startswith("json"):
+                p = p[4:].strip()
+            if p.startswith("{") or p.startswith("["):
+                candidates.append(p)
+        if candidates:
+            t = max(candidates, key=len)
+    # Slice from first brace to last brace
+    start = t.find("{")
+    end = t.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        # maybe it's a top-level list
+        start = t.find("[")
+        end = t.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("No JSON object found in text")
+    return json.loads(t[start:end + 1])
+
+
+def _call_llm_json(prompt: str, use_json_mode: bool = True):
+    """
+    One LLM call returning parsed JSON.
+
+    use_json_mode=True  → Groq's response_format json_object (server
+                          validates; can 400 with json_validate_failed).
+    use_json_mode=False → plain completion + client-side extraction,
+                          which can never 400 on validation. Used as the
+                          fallback after a json_validate failure.
+    """
+    kwargs = {
+        "messages": [{'role': 'user', 'content': prompt}],
+        "model": GENERATION_MODEL,
+    }
+    if use_json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    response = client.chat.completions.create(**kwargs)
+    raw = response.choices[0].message.content
+    if not raw or not raw.strip():
+        raise ValueError("Empty response body from LLM")
+    if use_json_mode:
+        return _unwrap_json_response(json.loads(raw))
+    return _unwrap_json_response(_extract_json_from_text(raw))
+
+
 def _unwrap_json_response(raw_data):
     """
     Groq's JSON mode usually returns a dict, but occasionally the model
@@ -1226,11 +1285,10 @@ def generate_dictation_exercise(target_word_dict):
     The following expressions appear here and have non-literal meaning:
 {lines}
     """
-
-    # Always include the full glossary so the model has reference
-    full_colloquialism_reference = "ITALIAN COLLOQUIAL GLOSSARY (reference for natural phrasing):\n"
-    for expr, (literal, real) in ITALIAN_COLLOQUIALISMS.items():
-        full_colloquialism_reference += f"   {expr}: literal = {literal}; actual usage = {real}\n"
+    # NOTE: the full ~20-entry colloquialism glossary used to be shipped in
+    # EVERY prompt (~800+ tokens/call). Removed — the free tier is limited
+    # by tokens/minute, and the glossary only matters when a colloquialism
+    # is actually in play (handled above).
 
     prompt = f"""
     You are an expert Italian tutor designing a LISTENING comprehension
@@ -1243,8 +1301,6 @@ def generate_dictation_exercise(target_word_dict):
     {behavior_prompt}
 
     {colloquialism_section}
-
-    {full_colloquialism_reference}
 
     GENERAL INSTRUCTIONS:
     1. ACCENT MARKS MATTER: use proper Italian accents (à, è, é, ì, ò, ù).
@@ -1325,38 +1381,36 @@ def generate_dictation_exercise(target_word_dict):
     }}
     """
 
-    # Call the LLM with up to 3 attempts. Transient errors (rate limits,
-    # timeouts, 5xx, malformed JSON) trigger backoff + retry. Auth and other
-    # errors fail fast.
+    # Call the LLM with up to 3 attempts. If Groq's server-side json
+    # validation rejects the output (400 json_validate_failed), the next
+    # attempt runs WITHOUT response_format and parses client-side — that
+    # path can never 400 on validation. Rate limits and auth fail fast.
     raw_data = None
     last_error_category = None
     last_error_desc = None
+    use_json_mode = True
     for attempt in range(3):
         try:
-            response = client.chat.completions.create(
-                messages=[{'role': 'user', 'content': prompt}],
-                model=GENERATION_MODEL,
-                response_format={"type": "json_object"}
-            )
-            raw_json_str = response.choices[0].message.content
-            if not raw_json_str or not raw_json_str.strip():
-                raise ValueError("Empty response body from LLM")
-            raw_data = _unwrap_json_response(json.loads(raw_json_str))
+            raw_data = _call_llm_json(prompt, use_json_mode=use_json_mode)
             break  # success
         except Exception as e:
             category, desc = _classify_llm_error(e)
             last_error_category, last_error_desc = category, desc
             logging.warning(
-                f"Dictation generation attempt {attempt + 1}/3 failed [{category}]: {desc}"
+                f"Dictation generation attempt {attempt + 1}/3 failed "
+                f"[{category}] (json_mode={use_json_mode}): {desc}"
             )
             if category == "auth":
                 logging.error("Auth failure — not retrying. Check GROQ_API_KEY in Streamlit secrets.")
                 break
             if category == "rate_limit":
                 # Don't waste retries — we'd just hit the same limit again.
-                # The caller surfaces a clear "wait 60s" message to the user.
                 logging.warning("Rate-limited — not retrying. Caller should surface 'wait' message.")
                 break
+            if category == "json_parse":
+                # Server rejected the JSON — retry in fallback mode where
+                # we parse client-side instead.
+                use_json_mode = False
             if attempt < 2:
                 _wait_before_retry(category, attempt)
 
@@ -1806,29 +1860,23 @@ def _generate_conjugation_drill_once(infinitive, english, tense, person, attempt
     """
 
     # Up to 3 sub-attempts for THIS call (separate from the outer retry
-    # loop that retries on verifier failures). These sub-attempts handle
-    # transient API errors (rate limits, timeouts, malformed JSON).
+    # loop that retries on verifier failures). After a server-side json
+    # validation failure, the next sub-attempt runs without response_format
+    # and parses client-side (can never 400 on validation).
     raw_data = None
     last_error_category = None
     last_error_desc = None
+    use_json_mode = True
     for sub_attempt in range(3):
         try:
-            response = client.chat.completions.create(
-                messages=[{'role': 'user', 'content': prompt}],
-                model=GENERATION_MODEL,
-                response_format={"type": "json_object"}
-            )
-            raw_json_str = response.choices[0].message.content
-            if not raw_json_str or not raw_json_str.strip():
-                raise ValueError("Empty response body from LLM")
-            raw_data = _unwrap_json_response(json.loads(raw_json_str))
+            raw_data = _call_llm_json(prompt, use_json_mode=use_json_mode)
             break
         except Exception as e:
             category, desc = _classify_llm_error(e)
             last_error_category, last_error_desc = category, desc
             logging.warning(
                 f"Conjugation drill API attempt {sub_attempt + 1}/3 failed "
-                f"[{category}]: {desc}"
+                f"[{category}] (json_mode={use_json_mode}): {desc}"
             )
             if category == "auth":
                 logging.error("Auth failure — not retrying. Check GROQ_API_KEY.")
@@ -1836,6 +1884,8 @@ def _generate_conjugation_drill_once(infinitive, english, tense, person, attempt
             if category == "rate_limit":
                 logging.warning("Rate-limited — not retrying.")
                 break
+            if category == "json_parse":
+                use_json_mode = False
             if sub_attempt < 2:
                 _wait_before_retry(category, sub_attempt)
 
