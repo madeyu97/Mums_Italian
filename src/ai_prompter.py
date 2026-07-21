@@ -315,10 +315,21 @@ def _call_llm_json(prompt: str, use_json_mode: bool = True):
                           which can never 400 on validation. Used as the
                           fallback after a json_validate failure.
     """
+    try:
+        from config import REASONING_EFFORT, MAX_GEN_TOKENS
+    except ImportError:
+        REASONING_EFFORT, MAX_GEN_TOKENS = "low", 2048
+
     kwargs = {
         "messages": [{'role': 'user', 'content': prompt}],
         "model": GENERATION_MODEL,
+        "max_completion_tokens": MAX_GEN_TOKENS,
     }
+    # Reasoning models (gpt-oss family) default to "medium" effort and
+    # burn 1-2k hidden thinking tokens per call — quota poison on the
+    # free tier. Force low effort where supported.
+    if REASONING_EFFORT and GENERATION_MODEL.startswith("openai/gpt-oss"):
+        kwargs["reasoning_effort"] = REASONING_EFFORT
     if use_json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     response = client.chat.completions.create(**kwargs)
@@ -1149,79 +1160,27 @@ DISTRACTOR_PLAYBOOKS = {
 # Universal rules appended to every prompt
 # ======================================================================
 UNIVERSAL_RULES = """
-    UNIVERSAL DISTRACTOR RULES (apply on top of the category playbook above):
+    UNIVERSAL DISTRACTOR RULES:
+    1. Every distractor varies the TARGET word's learning axis (clitic→clitic,
+       verb form→verb form, noun→that noun).
+    2. BANNED: plain polarity flips (unless target IS negation), absurd
+       sentences, pure synonym swaps, word-order-only changes.
+    3. All four options: grammatical English, within 3 words of each other
+       in length, plausible for someone who heard ~80% of the audio.
+    4. If the sentence contains near-homophones (anno/hanno, a/ha, o/ho,
+       e/è, la/là, capelli/cappelli, sete/sette, sono/sonno etc.),
+       distractors must NOT differ from the correct answer ONLY on such a
+       pair — audio can't disambiguate them.
 
-    1. ALL distractors must attack the TARGET word's learning axis, not random
-       other words in the sentence. If the target is a clitic, vary the clitic.
-       If it's a verb form, vary verb form. If it's a noun, vary that noun.
-
-    2. NO TRIVIAL DISTRACTORS — BANNED:
-       - Sentences with directly opposite polarity (e.g. "He came" vs "He didn't come")
-         UNLESS the target IS a negation.
-       - Sentences that are grammatically impossible or absurd
-       - Pure synonym swaps ("purchase" vs "buy")
-       - Word-order-only differences ("gave him the book" vs "gave the book to him")
-
-    3. ALL four options must be grammatical English of roughly equal length
-       (within 3 words of each other).
-
-    4. PLAUSIBILITY TEST: Could a learner who heard ~80% of the audio correctly
-       genuinely pick this distractor? If not, rewrite it.
-
-    SPELLING-TRAP / NEAR-HOMOPHONE HANDLING:
-
-    If the Italian sentence contains any of:
-      - anno/hanno, a/ha, o/ho, ai/hai  (h-drop in avere)
-      - e/è, se/sé, ne/né, la/là, li/lì, si/sì, da/dà  (accent-only)
-      - capelli/cappelli, pena/penna, sete/sette, nono/nonno, caro/carro,
-        sono/sonno, casa/cassa, note/notte, pala/palla, copia/coppia
-        (geminate consonants)
-    ...then DISTRACTORS MUST NOT differ from the correct answer ONLY on
-    one of these pairs. That would be unfair, since Whisper-quality audio
-    cannot reliably disambiguate them.
-
-    PRONOUN HEDGING / SUBJECT-VERB AGREEMENT (CRITICAL — read carefully):
-
-    Italian drops subject pronouns, so the verb ending tells you the person.
-    The English translation MUST match the person of the Italian verb.
-
-    Reference table of avere / essere endings — ALL OTHER VERBS FOLLOW THE
-    SAME PERSON PATTERN:
-      io      sono / ho           → "I am"  / "I have"
-      tu      sei  / hai          → "You are" / "You have"
-      lui/lei è    / ha           → "He/She is" / "He/She has"
-      noi     siamo / abbiamo     → "We are" / "We have"
-      voi     siete / avete       → "You all are" / "You all have"
-      loro    sono / hanno        → "They are" / "They have"
-
-    Generic verb endings:
-      -o   (parlo, mangio, dormo)        → "I"
-      -i   (parli, mangi, dormi)         → "You (singular)"
-      -a / -e  (parla, mangia, dorme)    → "He/She"
-      -iamo  (parliamo, mangiamo)        → "We"
-      -ate / -ete / -ite                 → "You all"
-      -ano / -ono  (parlano, mangiano,
-                    dormono, SONO)       → "They"
-
-    HARD RULES:
-    1. If the Italian verb is "sono" — the English MUST be "I am" OR
-       "They are", NEVER "He is" or "She is" or "He/She is". (The same
-       form serves both 1sg and 3pl; pick whichever the sentence context
-       makes natural.)
-    2. If the Italian verb is "è" — the English MUST be "He is" / "She is"
-       / "He/She is" or "It is" depending on subject. Never "I am" or
-       "They are".
-    3. If the Italian verb is "ha" — "He/She has" or "It has", never
-       "I have" or "They have".
-    4. If the Italian verb is "hanno" — "They have", never "He has".
-    5. Before returning, RE-READ your "english_correct" field and verify
-       its subject pronoun matches the conjugation of the main Italian
-       verb. If they don't match, REWRITE the english_correct.
-
-    Only when the Italian sentence has a 3rd-person singular verb (è, ha,
-    parla, mangia, dorme, etc.) with NO explicit subject should you hedge
-    as "He/She". For 1st and 2nd person verbs there's nothing to hedge —
-    the verb ending makes it unambiguous.
+    SUBJECT-VERB AGREEMENT (CRITICAL): Italian drops subject pronouns; the
+    verb ending determines the English subject. sono=I/They, sei=You,
+    è/ha=He/She/It, siamo=We, siete=You-all, hanno=They; endings -o=I,
+    -i=You, -a/-e=He/She, -iamo=We, -ate/-ete/-ite=You-all, -ano/-ono=They.
+    HARD RULES: "sono" is NEVER "He/She is". "è" is NEVER "I am" or "They
+    are". "ha" is NEVER "They have". "hanno" is NEVER "He has".
+    Before returning, re-check english_correct's subject against the main
+    verb's conjugation; rewrite if mismatched. Hedge as "He/She" only for
+    3sg verbs with no explicit subject.
 """
 
 
@@ -1302,17 +1261,9 @@ def generate_dictation_exercise(target_word_dict):
 
     {colloquialism_section}
 
-    GENERAL INSTRUCTIONS:
-    1. ACCENT MARKS MATTER: use proper Italian accents (à, è, é, ì, ò, ù).
-       Never write 'e' when you mean 'è'.
-    2. APOSTROPHES: use proper elision (l'amico, un'amica, dell'acqua, etc.)
-       when the next word begins with a vowel.
-    3. NO HALLUCINATED CONTEXT: don't invent random proper names. Use
-       generic subjects ("un amico", "la mia famiglia") if needed.
-    4. NUMERAL CONVERSION: if the target contains Arabic numerals, write
-       them as Italian words.
-    5. PRO-DROP: drop subject pronouns where natural. This is what makes
-       Italian audio hard for learners — embrace it.
+    GENERAL: use proper accents (never 'e' for 'è') and elision (l'amico,
+    un'amica); no invented proper names (use generic subjects); write
+    numerals as Italian words; drop subject pronouns where natural.
 
     ═══════════════════════════════════════════════════════════════════
     TARGET-AWARE DISTRACTOR DESIGN (THE MOST IMPORTANT SECTION)
@@ -1325,41 +1276,18 @@ def generate_dictation_exercise(target_word_dict):
 
     {UNIVERSAL_RULES}
 
-    GRAMMAR AND EXPRESSION NOTES:
-    Provide TWO teaching notes in the output:
-      1. 'grammar_point': pure SYNTAX — name the construction (e.g.
-         "passato prossimo with avere", "congiuntivo presente after credo che",
-         "articulated preposition in + il = nel", "ne as partitive pronoun").
-      2. 'expression_note': if the sentence contains a colloquialism, filler,
-         idiom, or discourse marker (magari, dai, allora, cioè, in bocca al lupo,
-         non vedo l'ora, etc.), explain its pragmatic/emotional force.
-         Return null ONLY if no such expression is present.
+    NOTES: 'grammar_point' names the construction (e.g. "congiuntivo
+    presente after credo che"). 'expression_note' explains any
+    colloquialism/idiom present (magari, dai, in bocca al lupo...); null
+    if none.
 
-    WORD BREAKDOWN:
-    Break the sentence into word units. For each word, give:
-      - the Italian word
-      - its English meaning IN THIS CONTEXT
-      - a short note: gender (m./f.), number (sing./pl.), or verb info
-        (e.g. "1st pers. sing. passato prossimo") if useful.
-      - CONGIUNTIVO DISAMBIGUATION (MANDATORY): if a verb is in the
-        congiuntivo, the note MUST both name the person AND preempt the
-        indicativo confusion, because -are congiuntivo forms in -i look
-        like 2nd person indicativo. Example note for 'parli' in
-        "penso che lei parli":
-          "3rd pers. sing. congiuntivo presente of parlare — NOT the
-           indicativo 'tu parli'; after 'penso che', io/tu/lui/lei all
-           take -i"
-        Never label a congiuntivo form with only "3rd person singular"
-        and no explanation — learners will read it as an error.
-      - VERB NOTES MUST BE SELF-CHECKED: before returning, re-verify
-        every person/tense label against the actual subject in the
-        sentence. A wrong label is worse than no label.
-      - OPTIONAL 'stress' field for words with NON-DEFAULT (non-penultimate) stress.
-        Default stress in Italian is penultimate, so OMIT this field for normal words.
-        Include ONLY for sdrucciole (antepenultimate stress) and bisdrucciole.
-        Format: capitalise the stressed syllable, e.g. "TE-le-fo-no", "À-bi-to",
-        "PRÀ-ti-co", "VEN-do-no", "MAN-gia-no", "DI-co-no". Words written with
-        a final written accent (città, perché, papà) are unambiguous — no need.
+    WORD BREAKDOWN: one entry per word: italian, contextual english, short
+    note (gender/number or verb person+tense). MANDATORY: congiuntivo verb
+    notes must name the person AND preempt indicativo confusion (e.g.
+    'parli' after "penso che" → "3rd sg. congiuntivo — NOT indicativo 'tu
+    parli'; io/tu/lui/lei all take -i"). Self-check every person/tense
+    label against the sentence's subject. Optional 'stress' field ONLY for
+    non-penultimate stress, e.g. "TE-le-fo-no".
 
     Output a raw JSON object EXACTLY in this format (no prose, no markdown):
     {{
@@ -1803,44 +1731,19 @@ def _generate_conjugation_drill_once(infinitive, english, tense, person, attempt
     {agreement_note}
 
     HARD CONSTRAINTS:
-    1. The English sentence MUST naturally force exactly the target tense
-       and person. For congiuntivo, frame it after a trigger like
-       "I think that...", "I doubt that...", "Although...", "It's important
-       that...", "If only...".
-       For condizionale, use "would..." / "I would have...".
-       For imperfetto, use "I was eating", "I used to eat", "while I was...",
-       background-description framing.
-       For passato prossimo, use a completed action with a specific moment.
-       For imperativo, use a command ("Eat your vegetables!").
-
-    2. The English subject MUST match the target person:
-         io      → "I"
-         tu      → "you" (singular)
-         lui/lei → "he" or "she" (or a singular noun: "Maria", "the dog")
-         noi     → "we"
-         voi     → "you all" / "you guys" (use plural to avoid ambiguity)
-         loro    → "they" (or a plural noun: "the children", "my friends")
-
-    3. The Italian sentence MUST have:
-       - The verb conjugated in the target tense AND person
-       - ALL adjectives, past participles, and agreement-bearing words
-         matching the subject's number and gender
-       - For PLURAL persons (noi, voi, loro): NO adjectives/participles
-         ending in -o or -a (those are singular!). Use -i (m.pl.) or -e (f.pl.).
-
-    4. For compound tenses (passato prossimo, trapassato, condizionale
-       passato), pick the correct auxiliary (avere vs essere) AND apply
-       past-participle agreement where required.
-
-    5. For -ire verbs, distinguish -isco verbs (finire, capire, preferire)
-       from non-isco verbs (dormire, partire, sentire).
-
-    SELF-CHECK BEFORE RETURNING:
-    Re-read your Italian translation. Confirm:
-      • The verb's ending matches the target person
-      • Every adjective and participle agrees in number with the subject
-      • If the English subject is plural (we/you all/they/the children/etc.),
-        NO Italian adjective or participle ends in -o or -a alone
+    1. English must FORCE the target tense+person (congiuntivo: after
+       "I think/doubt that…"; condizionale: "would…"; imperfetto:
+       "was …-ing / used to"; passato prossimo: completed action;
+       imperativo: a command).
+    2. English subject matches person: io=I, tu=you(sg), lui/lei=he/she
+       or singular noun, noi=we, voi=you all, loro=they or plural noun.
+    3. Italian: verb in exact target tense+person; ALL adjectives &
+       participles agree in number/gender — for noi/voi/loro NEVER end
+       an adjective/participle in singular -o/-a (use -i or -e).
+    4. Compound tenses: correct auxiliary (avere vs essere) + participle
+       agreement. -ire verbs: mind -isco class (finire) vs plain (dormire).
+    SELF-CHECK before returning: verb ending matches person; every
+    adjective/participle agrees; plural subject ⇒ no singular -o/-a.
 
     Output ONLY valid JSON, no prose, no markdown:
     {{
