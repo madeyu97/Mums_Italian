@@ -137,45 +137,22 @@ EXPECTED SENTENCE
 WHISPER TRANSCRIPTION OF STUDENT'S SPEECH
   {transcribed_text or "(empty - Whisper heard nothing intelligible)"}
 {drill_section}
-Grade three criteria on a 0-10 integer scale:
+Grade three criteria, each 0-10:
 
-1. VOCAB - did they produce the right words?
-   Be LENIENT on near-homophones Whisper routinely mishears:
-     - "anno" / "hanno"  (year / they have)
-     - "a" / "ha"        (to / has)
-     - "o" / "ho"        (or / I have)
-     - "ai" / "hai"      (to-the / you have)
-     - "e" / "è"         (and / is)
-     - "se" / "sé"       (if / oneself)
-     - "la" / "là"       (the / there)
-   If meaning is preserved, full credit. Penalise genuinely wrong word
-   choice that changes meaning.
+1. VOCAB: right words? LENIENT on Whisper near-homophones (anno/hanno,
+   a/ha, o/ho, ai/hai, e/è, se/sé, la/là) — full credit if meaning
+   preserved. Penalise genuinely wrong word choice.
 
-2. GRAMMAR - check ALL of the following where relevant:
-     - Gender agreement (il/la, un/una, -o/-a endings, past-participle
-       agreement with essere or with preceding direct object)
-     - Number agreement across article + noun + adjective
-     - Verb conjugation: right PERSON, TENSE, and MOOD
-         * Especially congiuntivo where required (after credo che, penso che,
-           voglio che, è necessario che, etc.)
-         * passato prossimo vs imperfetto distinction
-         * auxiliary choice (avere vs essere) and past-participle agreement
-     - Articulated prepositions (nel / dal / sul / della / etc.)
-     - Clitic pronoun choice and placement (mi/ti/ci/ne/lo/la, combos like
-       glielo, ce ne, me lo)
-   A sentence that is grammatical but means something different from the
-   target should score LOWER here, not in vocab.
+2. GRAMMAR: gender & number agreement, verb person/tense/mood (esp.
+   congiuntivo after penso/credo che; passato prossimo vs imperfetto;
+   avere-vs-essere + participle agreement), articulated prepositions,
+   clitic choice/placement. Grammatical-but-different-meaning scores
+   low HERE, not in vocab.
 
-3. PRONUNCIATION (proxy) - inferred from Whisper transcription fidelity:
-     9-10: Whisper transcribed the expected words exactly or near-exactly
-     6-8 : Most words right, a few errors
-     3-5 : Whisper produced a partly-different sentence
-     0-2 : Whisper produced garbled / empty output
-   IMPORTANT: This score is INDIRECT. It CANNOT assess:
-     - Open vs closed vowels (è/é, ò/ó)
-     - Geminate (double) consonants crispness (anno vs ano, pala vs palla)
-     - Italian rhythm and vowel quality
-   State this caveat explicitly in your feedback.
+3. PRONUNCIATION (proxy from Whisper fidelity): 9-10 near-exact,
+   6-8 mostly right, 3-5 partly different, 0-2 garbled. This is
+   INDIRECT — it cannot judge open/closed vowels or double consonants;
+   say so in feedback.
 
 Then map the overall performance to an SRS grade:
     "again" = effectively failed
@@ -194,12 +171,20 @@ Return ONLY a JSON object, no prose around it:
 """.strip()
 
     try:
-        resp = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model=GRADING_MODEL,
-            response_format={"type": "json_object"},
-            temperature=0.2,
-        )
+        try:
+            from config import REASONING_EFFORT, MAX_GRADE_TOKENS
+        except ImportError:
+            REASONING_EFFORT, MAX_GRADE_TOKENS = "low", 1024
+        grade_kwargs = {
+            "messages": [{"role": "user", "content": prompt}],
+            "model": GRADING_MODEL,
+            "response_format": {"type": "json_object"},
+            "temperature": 0.2,
+            "max_completion_tokens": MAX_GRADE_TOKENS,
+        }
+        if REASONING_EFFORT and GRADING_MODEL.startswith("openai/gpt-oss"):
+            grade_kwargs["reasoning_effort"] = REASONING_EFFORT
+        resp = client.chat.completions.create(**grade_kwargs)
         data = json.loads(resp.choices[0].message.content)
         for k in ("vocab_score", "grammar_score", "pronunciation_score"):
             data[k] = max(0, min(10, int(data.get(k, 0))))
