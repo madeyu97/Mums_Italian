@@ -83,6 +83,18 @@ GRADING_MODEL = "openai/gpt-oss-120b"
 WHISPER_MODEL = "whisper-large-v3"
 
 # ==========================================
+# 7b. TOKEN ECONOMY (free-tier survival)
+# ==========================================
+# gpt-oss models are reasoning models: at the default "medium" effort they
+# burn 1-2k hidden thinking tokens PER CALL, all counted against the
+# free tier's tokens-per-minute quota. "low" cuts that drastically —
+# this task needs a well-specified prompt, not deep reasoning.
+REASONING_EFFORT = "low"
+# Hard caps so a runaway response can't drain the minute's budget.
+MAX_GEN_TOKENS = 2048
+MAX_GRADE_TOKENS = 1024
+
+# ==========================================
 # 8. SRS MULTIPLIERS
 # ==========================================
 EASY_MULTIPLIER = 2.5
