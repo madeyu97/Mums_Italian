@@ -91,8 +91,12 @@ WHISPER_MODEL = "whisper-large-v3"
 # this task needs a well-specified prompt, not deep reasoning.
 REASONING_EFFORT = "low"
 # Hard caps so a runaway response can't drain the minute's budget.
-MAX_GEN_TOKENS = 2048
-MAX_GRADE_TOKENS = 1024
+# NOTE: gpt-oss counts hidden reasoning tokens against max_completion_tokens.
+# 2048 was too low — rich cards (detailed word_breakdown + distractors +
+# grammar note) got truncated mid-JSON, causing "every other card" failures.
+# 4096 comfortably fits the largest real card while still capping runaways.
+MAX_GEN_TOKENS = 4096
+MAX_GRADE_TOKENS = 1536
 
 # ==========================================
 # 8. SRS MULTIPLIERS
