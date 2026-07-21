@@ -203,6 +203,11 @@ CONJUGATION_HINT_KEYWORDS = (
 )
 
 
+class _TruncatedResponseError(Exception):
+    """Raised when the LLM response was cut off at max_completion_tokens."""
+    pass
+
+
 def _classify_llm_error(exc):
     """
     Classify an exception from an LLM call into a category we can
@@ -217,6 +222,8 @@ def _classify_llm_error(exc):
     import json as _json
     s = str(exc)
     low = s.lower()
+    if isinstance(exc, _TruncatedResponseError):
+        return ("truncated", f"Truncated: {s[:120]}")
     if isinstance(exc, _json.JSONDecodeError):
         return ("json_parse", f"Malformed JSON: {s[:120]}")
     # Groq sometimes returns HTTP 400 with json_validate_failed — treat
@@ -236,6 +243,63 @@ def _classify_llm_error(exc):
     return ("unknown", f"Unknown error ({type(exc).__name__}): {s[:200]}")
 
 
+def _generate_minimal_dictation(italian_text, english, hint=""):
+    """
+    Bare-bones fallback exercise. Requests the smallest useful JSON so it
+    can't truncate: a natural Italian sentence, its English translation,
+    and three plausible English distractors. No elaborate word breakdown,
+    grammar note, or expression note — those are what blow the token
+    budget on the full generator. Used only when the rich generator has
+    already failed, to keep the session moving instead of showing an error.
+    """
+    target = (italian_text or "").strip()
+    hint_part = f' (hint: {hint})' if hint else ''
+    prompt = f"""
+    Create a SHORT, natural Italian sentence (4-9 words) that uses the word
+    or phrase "{target}"{hint_part}, meaning roughly "{english}".
+
+    Then give its correct English translation and 3 plausible but WRONG
+    English translations (same length, grammatical, genuinely tempting for
+    a learner — vary the target word's grammar/meaning, not random words).
+
+    Output ONLY this JSON:
+    {{
+        "italian": "<the Italian sentence with correct accents>",
+        "english_correct": "<correct English translation>",
+        "english_distractors": ["<wrong 1>", "<wrong 2>", "<wrong 3>"]
+    }}
+    """
+    try:
+        data = _call_llm_json(prompt, use_json_mode=True)
+    except Exception as e:
+        # One more go without json-mode (parses client-side)
+        try:
+            data = _call_llm_json(prompt, use_json_mode=False)
+        except Exception as e2:
+            logging.warning(f"Minimal dictation fallback also failed: {e2}")
+            return None
+
+    it = (data.get("italian") or target).strip()
+    correct = (data.get("english_correct") or english or "").strip()
+    distractors = data.get("english_distractors") or []
+    # Ensure exactly 3 distractors; pad defensively if the model gave fewer
+    distractors = [d for d in distractors if isinstance(d, str) and d.strip()][:3]
+    while len(distractors) < 3:
+        distractors.append(f"(alternative meaning {len(distractors) + 1})")
+
+    return {
+        "exercise_type":   "listen",
+        "italian":         it,
+        "english_correct": correct,
+        "english_distractors": distractors,
+        "word_breakdown":  [],
+        "grammar_point":   {},
+        "expression_note": {},
+        "target_category": "general",
+        "_minimal_fallback": True,
+    }
+
+
 def _wait_before_retry(category, attempt):
     """
     Brief, non-blocking-feeling wait between retries.
@@ -251,7 +315,7 @@ def _wait_before_retry(category, attempt):
         _time.sleep(0.3 + attempt * 0.2)  # 0.3s, 0.5s, 0.7s
     elif category == "json_parse":
         _time.sleep(0.2)  # quick retry is fine for malformed JSON
-    # No sleep for rate_limit, auth, or unknown — fail fast or quick retry
+    # No sleep for rate_limit, auth, truncated, or unknown
 
 
 # Module-level: the category of the most recent generation failure
@@ -333,7 +397,19 @@ def _call_llm_json(prompt: str, use_json_mode: bool = True):
     if use_json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     response = client.chat.completions.create(**kwargs)
-    raw = response.choices[0].message.content
+    choice = response.choices[0]
+    raw = choice.message.content
+
+    # Detect truncation: if the model hit the token ceiling, the JSON is
+    # incomplete and will fail to parse. Raise a specific error so the
+    # retry loop can react (retry once at low effort usually fits; the
+    # caller also has a guaranteed-simple fallback).
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason == "length":
+        raise _TruncatedResponseError(
+            "Response hit max_completion_tokens (truncated JSON)."
+        )
+
     if not raw or not raw.strip():
         raise ValueError("Empty response body from LLM")
     if use_json_mode:
@@ -1343,6 +1419,16 @@ def generate_dictation_exercise(target_word_dict):
                 _wait_before_retry(category, attempt)
 
     if raw_data is None:
+        # Before giving up, try a MINIMAL exercise that asks for very
+        # little JSON — this can't truncate and is far more robust. Only
+        # skip this fallback for rate limits / auth, where any further
+        # call is pointless.
+        if last_error_category not in ("rate_limit", "auth"):
+            minimal = _generate_minimal_dictation(italian_text, english, hint)
+            if minimal is not None:
+                logging.info("Recovered via minimal-dictation fallback.")
+                _record_last_error(None)
+                return minimal
         logging.error(
             f"Dictation generation FAILED. Last error [{last_error_category}]: {last_error_desc}"
         )
