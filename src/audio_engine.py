@@ -5,10 +5,54 @@ import edge_tts
 import logging
 import random
 import re
+import time
+import uuid
 from config import DATA_DIR
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-AUDIO_PATH = DATA_DIR / "current_audio.mp3"
+
+# Every clip gets its OWN file.
+#
+# Previously all audio was written to a single shared "current_audio.mp3",
+# which caused three real bugs:
+#   1. Generating a slow (-25%) replay OVERWROTE the normal-speed clip, so
+#      every later replay of that card played the slow version.
+#   2. audio_history (used by Undo) stored the same path for every card, so
+#      undoing replayed the WRONG sentence's audio.
+#   3. Two people using the app at once overwrote each other's audio
+#      mid-playback.
+AUDIO_DIR = DATA_DIR / "audio"
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+# How long generated clips are kept before cleanup. Comfortably longer than
+# any single study session, so Undo can still replay earlier cards.
+AUDIO_MAX_AGE_SECONDS = 6 * 60 * 60  # 6 hours
+
+
+def _new_audio_path() -> str:
+    """A fresh, collision-free path for one clip."""
+    return str(AUDIO_DIR / f"tts_{uuid.uuid4().hex}.mp3")
+
+
+def _cleanup_old_audio():
+    """
+    Delete clips older than AUDIO_MAX_AGE_SECONDS so unique filenames can't
+    fill the disk over time. Best-effort: never raises, never blocks a card.
+    """
+    try:
+        cutoff = time.time() - AUDIO_MAX_AGE_SECONDS
+        for path in AUDIO_DIR.glob("tts_*.mp3"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                pass
+        # Remove the legacy shared file from older deployments if present.
+        legacy = DATA_DIR / "current_audio.mp3"
+        if legacy.exists() and legacy.stat().st_mtime < cutoff:
+            legacy.unlink()
+    except Exception:
+        pass
 
 # ==========================================
 # THE ITALIAN VOICE CAST
@@ -76,15 +120,24 @@ def create_audio_file(italian_text: str, voice: str = None, slow: bool = False):
     rate = "-25%" if slow else "+0%"
     logging.info(f"Attempting audio for: '{clean_text}' using {selected_voice} (rate={rate})")
 
-    # 3. Generate Audio
+    # 3. Generate Audio into a fresh file (see AUDIO_DIR note above)
+    _cleanup_old_audio()
+    out_path = _new_audio_path()
     try:
-        _run_tts_with_timeout(clean_text, selected_voice, str(AUDIO_PATH), rate)
-        return str(AUDIO_PATH)
+        _run_tts_with_timeout(clean_text, selected_voice, out_path, rate)
+        return out_path
     except Exception as e:
         logging.warning(f"Voice {selected_voice} failed ({e}). Trying fallback...")
         try:
-            _run_tts_with_timeout(clean_text, FALLBACK_VOICE, str(AUDIO_PATH), rate)
-            return str(AUDIO_PATH)
+            _run_tts_with_timeout(clean_text, FALLBACK_VOICE, out_path, rate)
+            return out_path
         except Exception as e_final:
             logging.error(f"Total Audio Failure: {e_final}")
+            # Don't leave a truncated/empty file behind for st.audio to choke on
+            try:
+                import os as _os
+                if _os.path.exists(out_path):
+                    _os.remove(out_path)
+            except OSError:
+                pass
             return None

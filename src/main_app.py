@@ -4,6 +4,7 @@ import streamlit as st
 import os
 import random
 import json
+import logging
 from datetime import date
 from urllib.parse import quote_plus
 
@@ -20,17 +21,21 @@ from db_manager import (
     flag_word_in_database, get_progress_stats, undo_word_progress,
     get_more_words, delete_word_from_db, update_word_in_db,
     mark_word_mastered, save_flagged_card,
+    ensure_initialized, check_connection, classify_db_error,
 )
 from speech_engine import transcribe_audio, grade_speech, GRADE_MAP
 from config import (
     LISTENING_PCT, MAX_REVIEWS_PER_DAY, MASTERED_INTERVAL_DAYS,
-    FLUENCY_TARGET, BREATH_PAUSE_EVERY, BREATH_PAUSE_SECONDS,
+    FLUENCY_TARGET, BREATH_PAUSE_EVERY, BREATH_PAUSE_SECONDS, DATA_DIR,
 )
 
 # ==========================================
 # 1. CACHE MANAGEMENT
 # ==========================================
-CACHE_FILE = "session_cache.json"
+# Absolute path under DATA_DIR. Previously a bare relative filename, which
+# resolved against the process working directory (inside the git checkout
+# on Streamlit Cloud) and could be wiped by a redeploy.
+CACHE_FILE = str(DATA_DIR / "session_cache.json")
 
 def load_cached_session():
     if os.path.exists(CACHE_FILE):
@@ -79,6 +84,41 @@ def clear_cached_session():
 # 2. APP CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Italian Immersion", page_icon="🇮🇹", layout="centered")
+
+# ==========================================
+# 2b. DATABASE HEALTH GATE
+# ==========================================
+# The database is set up lazily here rather than at import time, so a
+# sleeping/unreachable database produces a readable explanation instead
+# of a Python traceback.
+def render_db_problem(info):
+    """Human-readable database failure screen with concrete fix steps."""
+    st.title("🇮🇹 Italian Immersion Study")
+    st.error(f"**{info['headline']}**")
+
+    if info["category"] == "paused":
+        st.markdown(
+            "Nothing is lost — all your words and progress are still saved. "
+            "The database just needs waking up."
+        )
+
+    st.markdown("**How to fix it:**")
+    for i, step in enumerate(info["steps"], 1):
+        st.markdown(f"{i}. {step}")
+
+    if st.button("🔄 Try again", type="primary"):
+        ok, _ = check_connection()
+        if ok:
+            ensure_initialized(force=True)
+        st.rerun()
+
+    with st.expander("Technical detail"):
+        st.code(info["detail"], language="text")
+
+_db_ok, _db_info = ensure_initialized()
+if not _db_ok:
+    render_db_problem(_db_info)
+    st.stop()
 
 @st.cache_data(ttl=60, show_spinner=False)
 def cached_progress_stats():
@@ -207,14 +247,45 @@ def _maybe_trigger_breath_pause():
         st.session_state.breath_pause_active = True
         st.session_state.cards_since_break = 0
 
+def _safe_db_write(fn, *args, **kwargs):
+    """
+    Run a database write, converting failures into a readable message
+    instead of a traceback.
+
+    Mid-session the database can still blip (pooler drops an idle
+    connection, Supabase restarts, network hiccup). Previously that raised
+    straight through a button handler and killed the session. Now the card
+    stays put and the learner can retry without losing their place.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        fn(*args, **kwargs)
+        st.session_state.db_write_error = None
+        return True
+    except Exception as e:
+        category, headline, steps = classify_db_error(e)
+        logging.error(f"Database write failed [{category}]: {e}")
+        st.session_state.db_write_error = {
+            "headline": headline,
+            "steps": steps,
+            "detail": str(e)[:300],
+        }
+        return False
+
 def grade_word_and_next(grade):
     current_word = st.session_state.words_due[st.session_state.current_index]
-    process_review(
+    ok = _safe_db_write(
+        process_review,
         word_id=current_word['id'],
         current_interval=current_word['interval'],
         current_ease=current_word['ease_factor'],
         grade=grade
     )
+    if not ok:
+        # Don't advance — the grade wasn't saved. The learner keeps their
+        # place and can press the grade button again.
+        return
     st.session_state.current_index += 1
     reset_card_state()
     _maybe_trigger_breath_pause()
@@ -226,7 +297,9 @@ def mark_mastered_and_next():
     future and advances. Undo works the same as a normal grade.
     """
     current_word = st.session_state.words_due[st.session_state.current_index]
-    mark_word_mastered(current_word['id'], MASTERED_INTERVAL_DAYS)
+    ok = _safe_db_write(mark_word_mastered, current_word['id'], MASTERED_INTERVAL_DAYS)
+    if not ok:
+        return
     st.session_state.current_index += 1
     reset_card_state()
     _maybe_trigger_breath_pause()
@@ -236,7 +309,8 @@ def undo_last_grade():
     if st.session_state.current_index > 0:
         prev_index = st.session_state.current_index - 1
         original_word = st.session_state.words_due[prev_index]
-        undo_word_progress(
+        ok = _safe_db_write(
+            undo_word_progress,
             word_id=original_word['id'],
             old_next_review_date=original_word['next_review_date'],
             old_interval=original_word['interval'],
@@ -244,6 +318,8 @@ def undo_last_grade():
             old_review_count=original_word['review_count'],
             old_priority=original_word.get('priority_weight', 1)
         )
+        if not ok:
+            return
         st.session_state.current_index = prev_index
         idx_str = str(prev_index)
         st.session_state.current_exercise = st.session_state.exercise_history.get(idx_str)
@@ -443,6 +519,17 @@ if st.session_state.get("breath_pause_active", False):
 current_word = st.session_state.words_due[st.session_state.current_index]
 current_mode = st.session_state.modes[st.session_state.current_index]
 
+# If a grade/undo failed to save, say so here rather than crashing. The
+# card stays put so nothing is lost — pressing the button again retries.
+_write_err = st.session_state.get("db_write_error")
+if _write_err:
+    st.error(f"**Couldn't save that to the database.** {_write_err['headline']}")
+    st.caption("Your place is kept — press the button again to retry once it's back.")
+    with st.expander("What to do"):
+        for i, step in enumerate(_write_err["steps"], 1):
+            st.markdown(f"{i}. {step}")
+        st.code(_write_err["detail"], language="text")
+
 # Header row: progress / mode / undo
 total_words = len(st.session_state.words_due)
 col1, col2, col3 = st.columns([3, 1, 1])
@@ -614,6 +701,16 @@ if st.session_state.current_exercise is None:
                 "🔑 **API key error.** Your Groq API key seems to be missing or invalid. "
                 "Go to Streamlit Cloud → your app → ⋮ → Settings → Secrets, "
                 "and check that GROQ_API_KEY is correct."
+            )
+        elif err_cat == "model_gone":
+            st.error(
+                "🧠 **The AI model this app uses is no longer available.** "
+                "Groq retires older models periodically."
+            )
+            st.caption(
+                "Fix: open `src/config.py`, and set `GENERATION_MODEL` and "
+                "`GRADING_MODEL` to a current model from console.groq.com/docs/models. "
+                "Then commit and reboot the app."
             )
         elif err_cat == "json_parse":
             st.error(

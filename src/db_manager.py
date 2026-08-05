@@ -17,18 +17,138 @@ from config import (
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
+def classify_db_error(exc):
+    """
+    Turn a database exception into (category, headline, remedy_steps).
+
+    Categories:
+      'paused'    - Supabase project asleep/removed (pooler doesn't know the tenant)
+      'missing'   - DATABASE_URL not configured
+      'auth'      - wrong password / role
+      'network'   - DNS, refused, unreachable
+      'timeout'   - connect timed out
+      'unknown'   - anything else
+
+    This exists so the app can show a human explanation with exact fix
+    steps instead of a Python traceback.
+    """
+    s = str(exc)
+    low = s.lower()
+
+    if "database_url is missing" in low:
+        return (
+            "missing",
+            "The database address isn't configured.",
+            [
+                "Open share.streamlit.io and find this app.",
+                "Click ⋮ → Settings → Secrets.",
+                'Add a line: DATABASE_URL = "postgresql://..." '
+                "(copy it from Supabase → Project Settings → Database → Connection string → Session pooler).",
+                "Save, then reboot the app.",
+            ],
+        )
+
+    # The signature of a paused (or deleted) Supabase project: the pooler
+    # no longer recognises the project reference.
+    if ("tenant or user not found" in low
+            or "tenant/user" in low and "not found" in low
+            or "enotfound" in low):
+        return (
+            "paused",
+            "Your Supabase database is paused (or no longer exists).",
+            [
+                "Go to supabase.com and sign in.",
+                "Open the project for this app.",
+                'If it shows as paused, click "Restore project" and wait ~1-2 minutes.',
+                "Come back here and press Try again.",
+                "Free-tier Supabase projects pause after about a week of inactivity — "
+                "the keep-alive workflow in this repo is designed to prevent that.",
+            ],
+        )
+
+    if ("password authentication failed" in low
+            or "role" in low and "does not exist" in low):
+        return (
+            "auth",
+            "The database rejected the username or password.",
+            [
+                "In Supabase: Project Settings → Database → reset or copy the password.",
+                "In Streamlit: ⋮ → Settings → Secrets → update DATABASE_URL with the correct password.",
+                "Passwords with special characters must be URL-encoded.",
+                "Save, then reboot the app.",
+            ],
+        )
+
+    if "timeout" in low or "timed out" in low:
+        return (
+            "timeout",
+            "The database didn't respond in time.",
+            [
+                "This is usually temporary — press Try again.",
+                "If it keeps happening, check status.supabase.com for an outage.",
+            ],
+        )
+
+    if ("could not translate host name" in low
+            or "name or service not known" in low
+            or "connection refused" in low
+            or "could not connect" in low):
+        return (
+            "network",
+            "Couldn't reach the database server.",
+            [
+                "Check status.supabase.com for an outage.",
+                "Verify the host in DATABASE_URL matches your Supabase connection string.",
+                "Press Try again in a minute.",
+            ],
+        )
+
+    return (
+        "unknown",
+        "The database connection failed.",
+        [
+            "Press Try again — some failures are temporary.",
+            "If it persists, check that the Supabase project is running and "
+            "that DATABASE_URL in Streamlit Secrets is current.",
+        ],
+    )
+
+
+def _read_setting(name):
+    """
+    Read a setting from Streamlit secrets, falling back to environment
+    variables.
+
+    NOTE: `name in st.secrets` RAISES (not returns False) when no
+    secrets.toml exists, which previously made the environment-variable
+    fallback unreachable and turned a clear "missing setting" into an
+    opaque "No secrets found" error. Hence the try/except.
+    """
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.environ.get(name)
+
+
 def get_connection():
     """Establishes a connection to the Supabase PostgreSQL database."""
-    db_url = None
-    if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
-        db_url = st.secrets["DATABASE_URL"]
-    elif "DATABASE_URL" in os.environ:
-        db_url = os.environ["DATABASE_URL"]
+    db_url = _read_setting("DATABASE_URL")
     if not db_url:
         raise ValueError("CRITICAL ERROR: DATABASE_URL is missing! Streamlit cannot find it in the Secrets menu.")
     # connect_timeout stops the app hanging for minutes when Supabase is
     # paused (free tier pauses after ~1 week idle) or unreachable.
-    return psycopg2.connect(db_url, connect_timeout=10)
+    # keepalives stop long-idle connections being silently dropped by the
+    # pooler mid-session (a past source of mysterious mid-card failures).
+    return psycopg2.connect(
+        db_url,
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+    )
 
 def init_db():
     conn = get_connection()
@@ -396,6 +516,67 @@ def mark_word_mastered(word_id, interval_days):
     conn.commit()
     conn.close()
 
-# --- Initialization Block ---
-init_db()
-import_vocab_from_csv()
+# ----------------------------------------------------------------------
+# Initialisation
+# ----------------------------------------------------------------------
+# NOTE: this used to run init_db() + import_vocab_from_csv() at MODULE
+# IMPORT time. That meant any database problem (most commonly Supabase
+# free-tier auto-pausing after ~a week idle) crashed the entire app with
+# a raw Python traceback before a single pixel rendered.
+#
+# Initialisation is now lazy and guarded: main_app calls
+# ensure_initialized() and renders a human explanation on failure.
+
+_INIT_DONE = False
+
+
+def ensure_initialized(force=False):
+    """
+    Run one-time DB setup (create tables, import CSV if needed).
+
+    Idempotent: real work happens once per process unless force=True.
+
+    Returns (ok, info) where info is None on success, or a dict:
+        {"category": str, "headline": str, "steps": [str], "detail": str}
+    Never raises — callers can render the result instead of crashing.
+    """
+    global _INIT_DONE
+    if _INIT_DONE and not force:
+        return True, None
+    try:
+        init_db()
+        import_vocab_from_csv()
+        _INIT_DONE = True
+        return True, None
+    except Exception as e:
+        category, headline, steps = classify_db_error(e)
+        logging.error(f"Database initialisation failed [{category}]: {e}")
+        return False, {
+            "category": category,
+            "headline": headline,
+            "steps": steps,
+            "detail": str(e)[:400],
+        }
+
+
+def check_connection():
+    """
+    Lightweight liveness probe. Returns (ok, info) with the same shape as
+    ensure_initialized. Used by the retry button so we can re-test without
+    redoing the full import.
+    """
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        conn.close()
+        return True, None
+    except Exception as e:
+        category, headline, steps = classify_db_error(e)
+        return False, {
+            "category": category,
+            "headline": headline,
+            "steps": steps,
+            "detail": str(e)[:400],
+        }

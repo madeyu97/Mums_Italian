@@ -35,7 +35,10 @@ LANGUAGE_NAME = "Italian"     # Used in prompts
 # ==========================================
 # 4. SESSION SIZE
 # ==========================================
-MAX_REVIEWS_PER_DAY = 20  # Total cards in a session
+# Default number of cards offered on the setup screen. The learner can
+# still dial this up to their full vocabulary with the number input —
+# this is just the pre-filled starting value.
+MAX_REVIEWS_PER_DAY = 5   # Default cards per session
 NEW_WORDS_PER_DAY = 5     # Legacy — kept for backward compat
 
 # ==========================================

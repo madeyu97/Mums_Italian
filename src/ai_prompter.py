@@ -14,7 +14,28 @@ load_dotenv()
 # backoff by DEFAULT. Stacked under our own retry loops, a rate-limited
 # card could fire many hidden HTTP requests and hang for a minute+.
 # We handle retries ourselves (fast-failing) — the SDK must not.
-client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=25.0, max_retries=0)
+_client = None
+
+
+def _get_client():
+    """
+    Lazily construct the Groq client.
+
+    Constructing it at MODULE IMPORT time meant a missing/invalid
+    GROQ_API_KEY crashed the entire app with a traceback before anything
+    rendered. Now the error surfaces through the normal error-handling
+    path with a readable message.
+    """
+    global _client
+    if _client is None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GROQ_API_KEY is not set. Add it in Streamlit: "
+                "\u22ee \u2192 Settings \u2192 Secrets."
+            )
+        _client = Groq(api_key=api_key, timeout=25.0, max_retries=0)
+    return _client
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
@@ -230,10 +251,18 @@ def _classify_llm_error(exc):
     # like a JSON parse error and retry.
     if "json_validate_failed" in low or "failed to generate json" in low:
         return ("json_parse", f"LLM failed to produce valid JSON: {s[:120]}")
+    # Groq retires models periodically (llama-3.3-70b was decommissioned in
+    # June 2026). Retrying is pointless — the fix is a one-line config edit.
+    if ("decommissioned" in low or "model_not_found" in low
+            or ("model" in low and "does not exist" in low)
+            or ("model" in low and "not found" in low)):
+        return ("model_gone", f"Model unavailable/retired: {s[:160]}")
     if "429" in s or "rate limit" in low or "too many requests" in low:
         return ("rate_limit", f"Rate limit hit: {s[:120]}")
-    if "401" in s or "403" in s or "unauthorized" in low or "invalid api key" in low:
-        return ("auth", f"Auth error (key invalid?): {s[:120]}")
+    if ("401" in s or "403" in s or "unauthorized" in low
+            or "invalid api key" in low
+            or "groq_api_key is not set" in low):
+        return ("auth", f"Auth error (key missing/invalid?): {s[:120]}")
     if "500" in s or "502" in s or "503" in s or "504" in s:
         return ("transient", f"Server 5xx: {s[:120]}")
     if "timeout" in low or "timed out" in low:
@@ -396,7 +425,7 @@ def _call_llm_json(prompt: str, use_json_mode: bool = True):
         kwargs["reasoning_effort"] = REASONING_EFFORT
     if use_json_mode:
         kwargs["response_format"] = {"type": "json_object"}
-    response = client.chat.completions.create(**kwargs)
+    response = _get_client().chat.completions.create(**kwargs)
     choice = response.choices[0]
     raw = choice.message.content
 
@@ -1407,6 +1436,12 @@ def generate_dictation_exercise(target_word_dict):
             if category == "auth":
                 logging.error("Auth failure — not retrying. Check GROQ_API_KEY in Streamlit secrets.")
                 break
+            if category == "model_gone":
+                logging.error(
+                    "Model unavailable/retired — not retrying. "
+                    "Update GENERATION_MODEL in config.py."
+                )
+                break
             if category == "rate_limit":
                 # Don't waste retries — we'd just hit the same limit again.
                 logging.warning("Rate-limited — not retrying. Caller should surface 'wait' message.")
@@ -1423,7 +1458,7 @@ def generate_dictation_exercise(target_word_dict):
         # little JSON — this can't truncate and is far more robust. Only
         # skip this fallback for rate limits / auth, where any further
         # call is pointless.
-        if last_error_category not in ("rate_limit", "auth"):
+        if last_error_category not in ("rate_limit", "auth", "model_gone"):
             minimal = _generate_minimal_dictation(italian_text, english, hint)
             if minimal is not None:
                 logging.info("Recovered via minimal-dictation fallback.")
@@ -1869,6 +1904,9 @@ def _generate_conjugation_drill_once(infinitive, english, tense, person, attempt
             )
             if category == "auth":
                 logging.error("Auth failure — not retrying. Check GROQ_API_KEY.")
+                break
+            if category == "model_gone":
+                logging.error("Model unavailable/retired — not retrying.")
                 break
             if category == "rate_limit":
                 logging.warning("Rate-limited — not retrying.")

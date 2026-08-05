@@ -19,7 +19,28 @@ load_dotenv()
 # backoff by DEFAULT. Stacked under our own retry loops, a rate-limited
 # card could fire many hidden HTTP requests and hang for a minute+.
 # We handle retries ourselves (fast-failing) — the SDK must not.
-client = Groq(api_key=os.getenv("GROQ_API_KEY"), timeout=25.0, max_retries=0)
+_client = None
+
+
+def _get_client():
+    """
+    Lazily construct the Groq client.
+
+    Constructing it at MODULE IMPORT time meant a missing/invalid
+    GROQ_API_KEY crashed the entire app with a traceback before anything
+    rendered. Now the error surfaces through the normal error-handling
+    path with a readable message.
+    """
+    global _client
+    if _client is None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GROQ_API_KEY is not set. Add it in Streamlit: "
+                "\u22ee \u2192 Settings \u2192 Secrets."
+            )
+        _client = Groq(api_key=api_key, timeout=25.0, max_retries=0)
+    return _client
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
@@ -33,7 +54,7 @@ def transcribe_audio(audio_bytes, filename="speech.webm"):
         logging.error("transcribe_audio received empty bytes.")
         return None
     try:
-        resp = client.audio.transcriptions.create(
+        resp = _get_client().audio.transcriptions.create(
             file=(filename, audio_bytes),
             model=WHISPER_MODEL,
             language=LANGUAGE_CODE,           # "it" — pinned by config
@@ -184,7 +205,7 @@ Return ONLY a JSON object, no prose around it:
         }
         if REASONING_EFFORT and GRADING_MODEL.startswith("openai/gpt-oss"):
             grade_kwargs["reasoning_effort"] = REASONING_EFFORT
-        resp = client.chat.completions.create(**grade_kwargs)
+        resp = _get_client().chat.completions.create(**grade_kwargs)
         data = json.loads(resp.choices[0].message.content)
         for k in ("vocab_score", "grammar_score", "pronunciation_score"):
             data[k] = max(0, min(10, int(data.get(k, 0))))
