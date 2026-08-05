@@ -1,0 +1,19 @@
+# Pinned deliberately.
+#
+# WHY: these were previously unpinned, so every Streamlit Cloud reboot could
+# pull new versions. Across a few weeks of logs, streamlit drifted
+# 1.57 -> 1.58 -> 1.61 and groq 1.4 -> 1.6. One of those upgrades deprecated
+# `use_container_width`, which broke the app's buttons with no code change on
+# our side. Pinning makes reboots reproducible instead of a lottery.
+#
+# TO UPGRADE (deliberately, not by accident):
+#   1. Bump ONE package here.
+#   2. Commit, let it deploy, run a short study session.
+#   3. If anything breaks, revert that one line.
+
+streamlit==1.61.0
+pandas==3.0.5
+groq==1.6.0
+edge-tts==7.2.8
+python-dotenv==1.2.2
+psycopg2-binary==2.9.12

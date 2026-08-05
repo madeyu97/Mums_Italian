@@ -1,0 +1,52 @@
+name: Supabase keep-alive
+
+# Supabase free-tier projects pause after ~7 days of inactivity. A paused
+# project makes the app fail with "Tenant or user not found" until it's
+# restored by hand. This job runs a trivial query every 3 days so the
+# project never goes idle long enough to pause.
+#
+# SETUP (one time):
+#   GitHub repo -> Settings -> Secrets and variables -> Actions
+#   -> New repository secret
+#   Name:  DATABASE_URL
+#   Value: the same connection string used in Streamlit Secrets
+#
+# You can also trigger it manually: Actions tab -> Supabase keep-alive
+# -> Run workflow. That's a quick way to test the secret is correct.
+
+on:
+  schedule:
+    # 06:15 UTC every 3rd day. (GitHub may delay scheduled runs by a few
+    # minutes under load; the 7-day pause window leaves plenty of margin.)
+    - cron: "15 6 */3 * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install driver
+        run: pip install --quiet psycopg2-binary==2.9.12
+
+      - name: Ping database
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import os, sys, psycopg2
+
+          url = os.environ.get("DATABASE_URL")
+          if not url:
+              sys.exit("DATABASE_URL secret is not set on this repository.")
+
+          conn = psycopg2.connect(url, connect_timeout=20)
+          cur = conn.cursor()
+          cur.execute("SELECT count(*) FROM vocab_progress")
+          print("Keep-alive OK. vocab_progress rows:", cur.fetchone()[0])
+          conn.close()
+          PY
