@@ -28,7 +28,7 @@ from speech_engine import transcribe_audio, grade_speech, GRADE_MAP
 from config import (
     LISTENING_PCT, MAX_REVIEWS_PER_DAY, MASTERED_INTERVAL_DAYS,
     FLUENCY_TARGET, BREATH_PAUSE_EVERY, BREATH_PAUSE_SECONDS, DATA_DIR,
-    APP_BUILD,
+    APP_BUILD, GENERATION_MODEL,
 )
 
 # ==========================================
@@ -570,7 +570,26 @@ st.markdown("---")
 # 5.5 SIDEBAR
 # ==========================================
 with st.sidebar:
-    st.caption(f"Build `{APP_BUILD}`")
+    # Diagnostics: answers "did my change deploy?" and "why is there no
+    # setup screen?" without guesswork.
+    with st.expander(f"🔧 Diagnostics — build `{APP_BUILD}`"):
+        st.caption(f"Default session size: **{MAX_REVIEWS_PER_DAY}** cards")
+        st.caption(f"Model: `{GENERATION_MODEL}`")
+        try:
+            import streamlit as _stm, starlette as _sl
+            st.caption(f"streamlit {_stm.__version__} · starlette {getattr(_sl, '__version__', '?')}")
+        except Exception:
+            pass
+        if os.path.exists(CACHE_FILE):
+            st.caption("A saved session exists — the setup screen is skipped while it does.")
+            if st.button("🗑️ Clear saved session", key="diag_clear"):
+                try:
+                    os.remove(CACHE_FILE)
+                except OSError:
+                    pass
+                for k in list(st.session_state.keys()):
+                    del st.session_state[k]
+                st.rerun()
     st.header("📊 Global Progress")
     stats = cached_progress_stats()
 
